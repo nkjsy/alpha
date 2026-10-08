@@ -1,0 +1,52 @@
+# 用模拟数据跑通整个流程：python -m alpha run configs/example_synthetic.yaml
+name: synthetic_demo
+output_dir: output/synthetic_demo
+
+data:
+  source: synthetic
+  synthetic:
+    n_stocks: 300
+    n_days: 2016        # 约 8 年
+    seed: 42
+    momentum_strength: 0.25   # 植入的动量 alpha 强度
+
+universe:
+  min_dollar_volume: 0   # 真实数据建议 5e6 以上
+
+# 留出样本：研究、调参只看之前的数据，最后只跑一次
+holdout_start: "2021-01-01"
+
+factors:
+  - {name: momentum, lookback: 252, skip: 21}
+  - {name: reversal, window: 21}
+  - {name: low_vol, window: 63}
+  - {name: size}
+
+preprocess:
+  winsorize: mad        # mad / quantile / null
+  normalize: zscore     # zscore / rank
+  neutralize_sector: true
+  neutralize_size: false
+
+combine:
+  method: icir          # equal / ic / icir
+  window: 252
+  min_periods: 126
+
+portfolio:
+  freq: ME              # 调仓频率：W-FRI / ME / QE
+  horizon: 21           # 评估用的持有期（交易日），应与调仓频率匹配
+  n_long: 0.1           # 多头取前 10%
+  n_short: 0.1          # 空头取后 10%；0 = 纯多头
+  weighting: equal
+  max_weight: 0.05
+  n_quantiles: 5
+
+execution:
+  lag: 1                # 信号日后第 1 个交易日收盘成交
+
+costs:
+  commission_bps: 1
+  spread_bps: 5
+  impact_bps: 4
+  borrow_bps_annual: 50

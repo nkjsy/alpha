@@ -1,0 +1,46 @@
+# 真实数据模板：把价格和成分股文件放到 data/ 下
+name: nasdaq100_multifactor
+output_dir: output/nasdaq100
+
+data:
+  source: csv
+  prices: data/prices.csv          # date,ticker,open,close,volume[,market_cap,...]，close 为复权价
+  membership: data/membership.csv  # ticker,start,end —— 历史成分区间，必须包含已被剔除的股票
+  sectors: data/sectors.csv        # ticker,sector（可选）
+
+universe:
+  min_dollar_volume: 5.0e6
+
+holdout_start: "2022-01-01"
+
+factors:
+  - {name: momentum, lookback: 252, skip: 21}
+  - {name: low_vol, window: 63}
+  - {name: reversal, window: 21}
+  - {name: max_ret, window: 21}
+
+preprocess:
+  winsorize: mad
+  normalize: zscore
+  neutralize_sector: true
+  neutralize_size: true
+
+combine:
+  method: equal
+
+portfolio:
+  freq: ME
+  horizon: 21
+  n_long: 10
+  n_short: 0
+  weighting: equal
+  max_weight: 0.15
+
+execution:
+  lag: 1
+
+costs:
+  commission_bps: 1
+  spread_bps: 3
+  impact_bps: 2
+  borrow_bps_annual: 50
