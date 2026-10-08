@@ -32,6 +32,8 @@ class ResearchResult:
     backtest: BacktestResult
     oos_backtest: BacktestResult | None
     stats: dict[str, Any] = field(default_factory=dict)
+    score: pd.DataFrame | None = None
+    targets: pd.DataFrame | None = None
 
 
 def load_config(path: str | Path) -> dict:
@@ -60,7 +62,7 @@ def run_research(cfg: dict, data: MarketData | None = None, out_dir: str | Path 
 
     # 样本外留出：研究阶段的选择全部基于 holdout_start 之前
     holdout = cfg.get("holdout_start")
-    research_end = pd.Timestamp(holdout) - pd.Timedelta(days=1) if holdout else None
+    holdout_ts = pd.Timestamp(holdout) if holdout else None
 
     pp = cfg.get("preprocess", {})
     groups = data.sector_frame() if pp.get("neutralize_sector") else None
@@ -73,6 +75,13 @@ def run_research(cfg: dict, data: MarketData | None = None, out_dir: str | Path 
     lag = int(cfg.get("execution", {}).get("lag", 1))
     rebal = rebalance_schedule(data.dates, pf.get("freq", "ME"))
     fwd = data.forward_returns(horizon=horizon, lag=lag)
+    # 研究期调仓日：未来收益窗口（t+lag 到 t+lag+horizon）必须整段落在留出期之前
+    if holdout_ts is not None:
+        first_holdout = data.dates.searchsorted(holdout_ts)
+        end_pos = data.dates.get_indexer(rebal) + lag + horizon
+        res_dates = rebal[end_pos < first_holdout]
+    else:
+        res_dates = rebal
 
     factors: dict[str, pd.DataFrame] = {}
     rows = {}
@@ -84,12 +93,11 @@ def run_research(cfg: dict, data: MarketData | None = None, out_dir: str | Path 
             groups=groups, exposures=exposures,
         )
         factors[f.label] = x
-        res_dates = rebal[rebal <= research_end] if research_end is not None else rebal
         ev = evaluate_factor(x, fwd, horizon, rebalance_dates=res_dates, n_quantiles=pf.get("n_quantiles", 5))
         rows[f.label] = ev["summary"]
 
     factor_summary = pd.DataFrame(rows).T
-    corr = factor_correlation({k: v.reindex(rebal) for k, v in factors.items()})
+    corr = factor_correlation({k: v.reindex(res_dates) for k, v in factors.items()})
 
     comb_cfg = cfg.get("combine", {})
     score, w = combine(
@@ -105,11 +113,15 @@ def run_research(cfg: dict, data: MarketData | None = None, out_dir: str | Path 
     bt = run_backtest(targets, data.close, lag=lag, costs=cost)
 
     oos = None
-    if holdout:
-        oos_targets = targets[targets.index >= pd.Timestamp(holdout)]
+    if holdout_ts is not None:
+        oos_targets = targets[targets.index >= holdout_ts]
         if len(oos_targets):
             oos = run_backtest(oos_targets, data.close, lag=lag, costs=cost)
-        bt_is = run_backtest(targets[targets.index < pd.Timestamp(holdout)], data.close, lag=lag, costs=cost)
+        # 样本内回测的价格也必须截止在留出期之前，否则最后一次调仓后的持仓会一直漂移进留出期
+        close_is = data.close[data.close.index < holdout_ts]
+        is_targets = targets[targets.index < holdout_ts]
+        is_targets = is_targets[data.dates.get_indexer(is_targets.index) + lag < len(close_is)]
+        bt_is = run_backtest(is_targets, close_is, lag=lag, costs=cost)
     else:
         bt_is = bt
 
@@ -126,7 +138,7 @@ def run_research(cfg: dict, data: MarketData | None = None, out_dir: str | Path 
     if oos is not None:
         stats["out_of_sample"] = oos.summary()
 
-    result = ResearchResult(factor_summary, corr, w, bt, oos, stats)
+    result = ResearchResult(factor_summary, corr, w, bt, oos, stats, score=score, targets=targets)
     if out_dir or cfg.get("output_dir"):
         write_report(result, Path(out_dir or cfg["output_dir"]))
     return result
