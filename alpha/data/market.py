@@ -67,15 +67,22 @@ class MarketData:
                 return df
         raise KeyError(f"MarketData 中没有字段 {name!r}")
 
-    def forward_returns(self, horizon: int, lag: int = 1) -> pd.DataFrame:
+    def forward_returns(self, horizon: int, lag: int = 1, delisting_return: float = 0.0) -> pd.DataFrame:
         """t 日信号对应的未来收益：从 t+lag 收盘买入，持有 horizon 天。
 
         lag=1 表示 t 日收盘算出信号、t+1 日收盘成交，避免用当天收盘价成交的偏差。
+        持有期内退市（价格中断）的股票不会被丢弃：收益算到最后一个价格，再叠加
+        delisting_return。直接丢弃等于提前知道“谁会退市”，会让评估结果偏乐观。
         仅用于评估，绝不能作为因子输入。
         """
         entry = self.close.shift(-lag)
-        exit_ = self.close.shift(-(lag + horizon))
-        return exit_ / entry - 1.0
+        exit_raw = self.close.shift(-(lag + horizon))
+        # 数据末尾的行 shift 之后整行为 NaN，ffill 版本同样为 NaN，因此不会把“数据结束”误当成退市
+        exit_last = self.close.ffill().shift(-(lag + horizon))
+        fwd = exit_last / entry - 1.0
+        delisted = exit_raw.isna() & exit_last.notna() & entry.notna()
+        fwd = fwd.mask(delisted, (1 + fwd) * (1 + delisting_return) - 1)
+        return fwd.where(entry.notna())
 
     def slice(self, start=None, end=None) -> "MarketData":
         sl = slice(start, end)
