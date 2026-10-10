@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import shutil
 from pathlib import Path
 
 import pandas as pd
@@ -96,6 +98,7 @@ def download_yahoo_ohlcv(
     字段：open / close（只做拆股调整）、adj_close（拆股 + 分红调整，用于算收益）、volume、splits。
     市值要用 close（不含分红调整）乘股本，否则历史市值会被未来分红压低。
     start 为空时下载全部历史；股票很多时指定 start、只取需要的 fields 以节省内存。
+    每批下载完先存到 <cache>_parts/ 目录，中途断了重跑会跳过已完成的批次，全部完成后再合并。
     """
     cache = Path(cache)
     if cache.exists() and not refresh:
@@ -106,17 +109,28 @@ def download_yahoo_ohlcv(
     cols = {k: v for k, v in cols.items() if k in fields}
     period = {"start": start} if start else {"period": "max"}
     parts: dict[str, list[pd.DataFrame]] = {k: [] for k in cols}
+    part_dir = cache.with_name(cache.stem + "_parts")
+    part_dir.mkdir(parents=True, exist_ok=True)
     for i in range(0, len(tickers), chunk):
         sub = tickers[i : i + chunk]
-        raw = yf.download(sub, **period, interval="1d", auto_adjust=False, actions=True, progress=False,
-                          group_by="column")
-        for field, col in cols.items():
-            if isinstance(raw.columns, pd.MultiIndex):
-                df = raw[col] if col in raw.columns.get_level_values(0) else pd.DataFrame(index=raw.index)
-            else:
-                df = raw[[col]].rename(columns={col: sub[0]}) if col in raw.columns else pd.DataFrame(index=raw.index)
-            parts[field].append(df.astype(dtype) if dtype and field != "splits" else df)
-        print(f"下载 {min(i + chunk, len(tickers))}/{len(tickers)}")
+        key = hashlib.md5("|".join([*sub, *cols, str(start), str(dtype)]).encode()).hexdigest()[:12]
+        part_file = part_dir / f"{i // chunk:05d}_{key}.pkl"
+        if part_file.exists():
+            got = pd.read_pickle(part_file)
+        else:
+            raw = yf.download(sub, **period, interval="1d", auto_adjust=False, actions=True, progress=False,
+                              group_by="column")
+            got = {}
+            for field, col in cols.items():
+                if isinstance(raw.columns, pd.MultiIndex):
+                    df = raw[col] if col in raw.columns.get_level_values(0) else pd.DataFrame(index=raw.index)
+                else:
+                    df = raw[[col]].rename(columns={col: sub[0]}) if col in raw.columns else pd.DataFrame(index=raw.index)
+                got[field] = df.astype(dtype) if dtype and field != "splits" else df
+            pd.to_pickle(got, part_file)
+            print(f"下载 {min(i + chunk, len(tickers))}/{len(tickers)}")
+        for field in cols:
+            parts[field].append(got[field])
     out = {}
     for field, frames in parts.items():
         df = pd.concat(frames, axis=1)
@@ -124,6 +138,7 @@ def download_yahoo_ohlcv(
         out[field] = df.loc[:, ~df.columns.duplicated()].sort_index()
     cache.parent.mkdir(parents=True, exist_ok=True)
     pd.to_pickle(out, cache)
+    shutil.rmtree(part_dir, ignore_errors=True)
     return out
 
 

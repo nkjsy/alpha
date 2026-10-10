@@ -128,3 +128,34 @@ def test_industry_helpers():
 def test_winsorize_keeps_signal_when_mad_is_zero():
     x = pd.DataFrame([[0.0] * 8 + [1.0, 3.0]])
     assert winsorize_mad(x).iloc[0].tolist() == x.iloc[0].tolist()
+
+
+def test_yahoo_download_resumes_from_chunk_cache(tmp_path, monkeypatch):
+    import sys
+    import types
+
+    from alpha.data.loaders import download_yahoo_ohlcv
+
+    calls = []
+
+    def fake_download(sub, **kw):
+        calls.append(list(sub))
+        if len(calls) == 2 and not hasattr(fake_download, "ok"):
+            raise ConnectionError("断线")
+        idx = pd.bdate_range("2020-01-01", periods=3)
+        cols = pd.MultiIndex.from_product([["Open", "Close", "Adj Close", "Volume", "Stock Splits"], sub])
+        return pd.DataFrame(1.0, index=idx, columns=cols)
+
+    monkeypatch.setitem(sys.modules, "yfinance", types.SimpleNamespace(download=fake_download))
+    cache = tmp_path / "raw.pkl"
+    tickers = ["A", "B", "C", "D"]
+    try:
+        download_yahoo_ohlcv(tickers, cache, chunk=2)
+    except ConnectionError:
+        pass
+    assert not cache.exists()
+    fake_download.ok = True
+    out = download_yahoo_ohlcv(tickers, cache, chunk=2)
+    assert calls == [["A", "B"], ["C", "D"], ["C", "D"]]          # 第一批没有重新下载
+    assert list(out["close"].columns) == tickers and cache.exists()
+    assert not (tmp_path / "raw_parts").exists()
