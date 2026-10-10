@@ -212,3 +212,32 @@ class SalesGrowth(Factor):
     def compute(self, data: MarketData) -> pd.DataFrame:
         r = data.field("revenue_ttm")
         return r / r.shift(self.lag).where(r.shift(self.lag) > 0) - 1
+
+
+@register
+class QualityComposite(Factor):
+    """综合质量：毛利/资产、营业利润/权益、ROE、低净发行、低应计的截面 z 分数均值（Asness 等 QMJ 思路）。
+
+    单个质量指标噪声大，合成后更稳定；缺失的分项按剩余分项平均。
+    """
+
+    name = "quality_composite"
+
+    COMPONENTS = ("gross_profitability", "operating_profitability", "roe", "low_net_issuance", "low_accruals")
+
+    def compute(self, data: MarketData) -> pd.DataFrame:
+        from alpha.factors.base import build_factor
+        from alpha.preprocess import apply_universe, winsorize_mad, zscore
+
+        parts = []
+        for name in self.COMPONENTS:
+            try:
+                x = build_factor(name).compute(data)
+            except KeyError:
+                continue
+            parts.append(zscore(winsorize_mad(apply_universe(x, data.universe))))
+        if not parts:
+            raise KeyError("quality_composite 需要基本面字段")
+        total = sum(p.fillna(0) for p in parts)
+        count = sum(p.notna().astype(int) for p in parts)
+        return (total / count.replace(0, np.nan)).where(count > 0)

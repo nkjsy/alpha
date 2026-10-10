@@ -72,6 +72,7 @@ CANDIDATES: list[dict] = [
     {"name": "low_leverage"},
     {"name": "sales_growth"},
     {"name": "sue"},
+    {"name": "quality_composite"},
 ]
 
 

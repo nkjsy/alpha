@@ -61,7 +61,7 @@ def test_align_fundamental_respects_availability():
 FUNDAMENTAL_FACTORS = [
     "book_to_market", "earnings_yield", "sales_to_price", "cfo_yield", "gross_profitability",
     "operating_profitability", "roe", "low_accruals", "low_asset_growth", "low_net_issuance",
-    "low_leverage", "sue", "sales_growth",
+    "low_leverage", "sue", "sales_growth", "quality_composite",
 ]
 FIELDS = ["book_value", "market_cap", "earnings_ttm", "revenue_ttm", "cfo_ttm", "gross_profit_ttm",
           "operating_income_ttm", "assets", "shares", "liabilities", "sue"]
