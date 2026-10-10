@@ -1,4 +1,4 @@
-"""纳指100历史成分上的因子挖掘（价量 + SEC 基本面）。
+"""历史成分股池上的因子挖掘（价量 + SEC 基本面 + 可选的行业中性、内部人、13F）。
 
 研究期（holdout_start 之前）上批量评估候选因子，相对现有 11-1 动量计算增量 IC，
 经 BH 多重检验校正与相关性去重后挑选；最后只在留出期检验一次入选因子与组合。
@@ -6,6 +6,9 @@
 用法（需要能访问 Yahoo Finance 和 sec.gov，pip install yfinance）：
   python scripts/mine_factors.py --membership C:/money/fin/nasdaq/nasdaq100_monthly_constituents_backtest_2010_2026.csv \
       --sec-user-agent "你的名字 你的邮箱"
+近似罗素1000（先运行 scripts/build_r1000_universe.py），并在标普500子池内复核：
+  python scripts/mine_factors.py --membership data/r1000_monthly_constituents.csv --cache data/cache/r1000_yahoo_raw.pkl \
+      --industry --insider --inst --sub-membership data/sp500_monthly_constituents.csv --out output/factor_mining_r1000
 """
 
 from __future__ import annotations
@@ -20,13 +23,15 @@ from alpha.backtest import CostModel, run_backtest
 from alpha.combine import equal_weight
 from alpha.data.loaders import download_yahoo_ohlcv, market_from_yahoo_raw
 from alpha.data.market import MarketData
-from alpha.data.sec import build_fields, fetch_records
+from alpha.data.insider import fetch_insider_events, insider_fields
+from alpha.data.sec import build_fields, fetch_records, fetch_sic, fetch_ticker_map, industry_frame
+from alpha.data.thirteenf import breadth_fields, fetch_13f, fetch_cusip_map
 from alpha.data.universe import snapshot_mask
 from alpha.evaluate import information_coefficient
 from alpha.metrics import deflated_sharpe_ratio, performance_summary
 from alpha.mining import build_candidates, mine_factors, oriented
 from alpha.portfolio import build_weights, rebalance_schedule
-from alpha.preprocess import standard_pipeline
+from alpha.preprocess import apply_universe, group_demean, standard_pipeline, winsorize_mad, zscore
 from alpha.validation import ExperimentLog
 
 BASELINE = {"name": "momentum", "lookback": 252, "skip": 21}  # 现有策略的 11-1 动量
@@ -73,7 +78,17 @@ CANDIDATES: list[dict] = [
     {"name": "sales_growth"},
     {"name": "sue"},
     {"name": "quality_composite"},
+    # 另类数据（需 --insider / --inst，缺字段时自动跳过）
+    {"name": "insider_net_ratio"},
+    {"name": "insider_buyers"},
+    {"name": "inst_breadth_chg"},
 ]
+
+# 价值、质量类因子的行业差异很大（银行的账面市值比天然高、软件的毛利率天然高），
+# 加 --industry 时额外评估它们在 FF12 行业内去均值后的版本（名字后缀 |ind）
+INDUSTRY_NEUTRAL = ["book_to_market", "earnings_yield", "sales_to_price", "cfo_yield", "gross_profitability",
+                    "operating_profitability", "roe", "low_accruals", "low_asset_growth", "low_leverage",
+                    "quality_composite"]
 
 
 def load_membership(path: str | Path, start: str) -> pd.DataFrame:
@@ -107,13 +122,33 @@ def backtest_split(score: pd.DataFrame, close: pd.DataFrame, reb: pd.DatetimeInd
     return {"research": bt_is.summary(), "holdout": bt_oos.summary(), "_is_returns": bt_is.returns}
 
 
+def industry_variants(cands: dict[str, pd.DataFrame], groups: pd.DataFrame, universe: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    out = {}
+    for name in INDUSTRY_NEUTRAL:
+        if name in cands:
+            x = zscore(winsorize_mad(apply_universe(cands[name], universe)))
+            out[f"{name}|ind"] = group_demean(x, groups)
+    return out
+
+
 def run(data: MarketData, start: str, holdout: str, horizon: int = 21, lag: int = 1, top_n: int = 10,
-        min_t: float = 3.0, max_corr: float = 0.6, log_path: str | Path = "output/factor_mining/experiments.jsonl"):
+        min_t: float = 3.0, max_corr: float = 0.6, log_path: str | Path = "output/factor_mining/experiments.jsonl",
+        groups: pd.DataFrame | None = None, sub_universe: pd.DataFrame | None = None):
+    """groups        行业宽表，给出时加入价值/质量因子的行业中性版本
+    sub_universe  子股票池（如标普500），给出时在子池内重算增量 IC，检查结论能否用到你实际交易的股票上
+    """
     reb, research, hold = research_and_holdout_dates(data.dates, start, holdout, lag, horizon)
-    fwd = data.forward_returns(horizon=horizon, lag=lag)
-    cands = build_candidates(CANDIDATES, data)
-    base_raw = build_candidates([BASELINE], data)
+    fwd = data.forward_returns(horizon=horizon, lag=lag).reindex(reb)
+    cands = build_candidates(CANDIDATES, data, dates=reb)
+    if groups is not None:
+        cands.update(industry_variants(cands, groups.reindex(reb), data.universe.reindex(reb)))
+    base_raw = build_candidates([BASELINE], data, dates=reb)
     res = mine_factors(data, cands, research, fwd, baseline=base_raw, min_t=min_t, max_corr=max_corr)
+    if sub_universe is not None:
+        sub = sub_universe.reindex_like(data.universe).fillna(False).astype(bool) & data.universe.astype(bool)
+        res_sub = mine_factors(data, cands, research, fwd, baseline=base_raw, universe=sub, min_t=np.inf)
+        res.table["ic_incr_sub"] = res_sub.table["ic_incr"]
+        res.table["t_incr_sub"] = res_sub.table["t_incr"]
 
     log = ExperimentLog(log_path)
     for name, row in res.table.iterrows():
@@ -154,12 +189,17 @@ def main() -> None:
     p.add_argument("--sec-user-agent", default="alpha-research research@example.com",
                    help="SEC 要求的 User-Agent，格式“名字 邮箱”")
     p.add_argument("--sec-cache", default="data/cache/sec")
+    p.add_argument("--yahoo-start", default=None, help="价格下载起点，默认全部历史")
+    p.add_argument("--industry", action="store_true", help="加入价值/质量因子的行业中性版本（SEC SIC -> FF12）")
+    p.add_argument("--insider", action="store_true", help="加入内部人交易因子（SEC Form 4 数据集）")
+    p.add_argument("--inst", action="store_true", help="加入机构持仓变化因子（SEC 13F 数据集，2013 年起）")
+    p.add_argument("--sub-membership", default=None, help="子股票池成分表（如标普500），在子池内复核增量 IC")
     p.add_argument("--out", default="output/factor_mining")
     args = p.parse_args()
 
     membership = load_membership(args.membership, "2010-01-01")
     tickers = sorted(membership["ticker"].unique())
-    raw = download_yahoo_ohlcv(tickers, args.cache, args.refresh)
+    raw = download_yahoo_ohlcv(tickers, args.cache, args.refresh, start=args.yahoo_start)
     adj = raw["adj_close"].dropna(how="all", axis=1)
     universe = snapshot_mask(membership, adj.index, adj.columns)
     fields = {}
@@ -169,13 +209,38 @@ def main() -> None:
         cov = fields["market_cap"].notna() & universe if "market_cap" in fields else universe & False
         print(f"SEC 基本面覆盖：{len(records)}/{len(adj.columns)} 只有数据；"
               f"调仓日池内有市值的比例 {(cov.sum(axis=1) / universe.sum(axis=1)).loc['2011':].mean():.1%}")
+    if args.insider or args.inst:
+        cmap = {v: k for k, v in fetch_ticker_map(args.sec_user_agent, args.sec_cache).items()}
+    if args.insider:
+        ev = fetch_insider_events(2009, adj.index[-1], args.sec_user_agent, args.sec_cache)
+        fields.update(insider_fields(ev, adj.index, adj.columns, cik_to_ticker=cmap))
+        print(f"Form 4：{len(ev)} 笔公开市场买卖；调仓日池内过去半年有内部人买入的比例 "
+              f"{((fields['insider_buyers'] > 0) & universe).sum(axis=1).loc['2011':].mean() / universe.sum(axis=1).loc['2011':].mean():.1%}")
+    if args.inst:
+        holders, filers = fetch_13f(args.sec_user_agent, args.sec_cache)
+        cusips = fetch_cusip_map("2013-01", adj.index[-1], args.sec_user_agent, args.sec_cache)
+        fields.update(breadth_fields(holders, filers, cusips, adj.index, adj.columns))
+        cov = (fields["inst_breadth_chg"].notna() & universe).sum(axis=1).loc["2015":]
+        print(f"13F：{filers['period'].nunique() if len(filers) else 0} 个季度；2015 年起调仓日池内有数据的比例 "
+              f"{cov.mean() / universe.sum(axis=1).loc['2015':].mean():.1%}")
+    groups = None
+    if args.industry:
+        sic = fetch_sic(list(adj.columns), args.sec_user_agent, args.sec_cache)
+        groups = industry_frame(sic, adj.index)
+        print(f"行业：{sic.notna().mean():.1%} 的股票有 SIC 代码")
+    sub_universe = None
+    if args.sub_membership:
+        sub_universe = snapshot_mask(load_membership(args.sub_membership, "2010-01-01"), adj.index, adj.columns)
     data = market_from_yahoo_raw(raw, universe=universe, fields=fields)
 
     out = Path(args.out)
     res, hold, bts, n_trials = run(data, args.start, args.holdout, top_n=args.top_n, min_t=args.min_t,
-                                   max_corr=args.max_corr, log_path=out / "experiments.jsonl")
+                                   max_corr=args.max_corr, log_path=out / "experiments.jsonl",
+                                   groups=groups, sub_universe=sub_universe)
     pd.set_option("display.width", 220)
     cols = ["ic_mean", "t_stat", "ic_incr", "t_incr", "q_bh", "sign_stable", "corr_baseline", "rank_autocorr", "ls_ann", "selected"]
+    if "t_incr_sub" in res.table:
+        cols[4:4] = ["ic_incr_sub", "t_incr_sub"]
     print(f"\n== 研究期 {args.start} ~ {args.holdout}（{int(res.table['n'].max())} 个月），相对 11-1 动量的增量 ==")
     print(res.table[cols].astype({"q_bh": float}).round(3).to_string())
     print(f"\n入选（|t_incr|≥{args.min_t}、q≤0.05、前后半段同号、互相关≤{args.max_corr}）：{res.selected or '无'}")

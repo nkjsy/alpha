@@ -27,7 +27,9 @@ import pandas as pd
 from alpha.factors.fundamental import align_fundamental
 
 TICKER_MAP_URL = "https://www.sec.gov/files/company_tickers.json"
+TICKER_EXCHANGE_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
 FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
+SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik:010d}.json"
 
 # 字段 -> (类型, 按优先级排列的 (taxonomy, tag, unit))
 CONCEPTS: dict[str, tuple[str, list[tuple[str, str, str]]]] = {
@@ -74,18 +76,18 @@ ANNUAL_DAYS = (340, 390)
 
 # ----------------------------------------------------------------------------- 下载
 
-def _get_json(url: str, user_agent: str, retries: int = 3) -> dict:
+def get_bytes(url: str, user_agent: str, retries: int = 3, timeout: int = 120) -> bytes:  # pragma: no cover - network
     import urllib.request
 
     req = urllib.request.Request(url, headers={"User-Agent": user_agent, "Accept-Encoding": "gzip"})
     for i in range(retries):
         try:
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 raw = r.read()
                 if r.headers.get("Content-Encoding") == "gzip":
                     raw = gzip.decompress(raw)
-                return json.loads(raw)
-        except Exception as e:  # pragma: no cover - network
+                return raw
+        except Exception as e:
             if getattr(e, "code", None) == 404:
                 raise
             if i == retries - 1:
@@ -94,16 +96,98 @@ def _get_json(url: str, user_agent: str, retries: int = 3) -> dict:
     raise RuntimeError("unreachable")
 
 
+def _get_json(url: str, user_agent: str, retries: int = 3) -> dict:  # pragma: no cover - network
+    return json.loads(get_bytes(url, user_agent, retries))
+
+
+def _cached_json(url: str, user_agent: str, f: Path) -> dict:
+    if f.exists():
+        return json.loads(f.read_text())
+    data = _get_json(url, user_agent)  # pragma: no cover - network
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps(data))
+    return data
+
+
 def fetch_ticker_map(user_agent: str, cache_dir: str | Path) -> dict[str, int]:
     """当前上市公司的 ticker -> CIK。已退市公司不在其中，可用 extra_map 补充。"""
-    f = Path(cache_dir) / "company_tickers.json"
-    if f.exists():
-        data = json.loads(f.read_text())
-    else:  # pragma: no cover - network
-        data = _get_json(TICKER_MAP_URL, user_agent)
-        f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_text(json.dumps(data))
+    data = _cached_json(TICKER_MAP_URL, user_agent, Path(cache_dir) / "company_tickers.json")
     return {v["ticker"].upper().replace(".", "-"): int(v["cik_str"]) for v in data.values()}
+
+
+def fetch_listed_companies(user_agent: str, cache_dir: str | Path,
+                           exchanges: tuple[str, ...] = ("NYSE", "Nasdaq")) -> pd.DataFrame:
+    """当前在交易所挂牌的公司（ticker, cik, name, exchange）。只有现存公司，已退市的不在其中。"""
+    data = _cached_json(TICKER_EXCHANGE_URL, user_agent, Path(cache_dir) / "company_tickers_exchange.json")
+    df = pd.DataFrame(data["data"], columns=data["fields"])
+    df["ticker"] = df["ticker"].astype(str).str.upper().str.replace(".", "-", regex=False)
+    return df[df["exchange"].isin(exchanges)].reset_index(drop=True)
+
+
+def fetch_sic(tickers: Iterable[str], user_agent: str, cache_dir: str | Path, sleep: float = 0.12) -> pd.Series:
+    """ticker -> SIC 行业代码（来自 submissions API，结果缓存在 sic.csv）。
+
+    注意：SIC 是公司当前的登记行业，不是历史时点值；公司改行业很少见，前视影响很小。
+    """
+    cache = Path(cache_dir)
+    f = cache / "sic.csv"
+    known = pd.read_csv(f, dtype={"ticker": str}).set_index("ticker")["sic"] if f.exists() else pd.Series(dtype=float)
+    todo = [t for t in tickers if t not in known.index]
+    if todo:  # pragma: no cover - network
+        cmap = fetch_ticker_map(user_agent, cache)
+        new = {}
+        for i, t in enumerate(todo):
+            cik = cmap.get(t)
+            if cik is None:
+                new[t] = np.nan
+                continue
+            try:
+                sic = _get_json(SUBMISSIONS_URL.format(cik=cik), user_agent).get("sic")
+                new[t] = float(sic) if sic not in (None, "") else np.nan
+            except Exception as e:
+                print(f"SIC 下载失败 {t}：{e}")
+                continue
+            time.sleep(sleep)
+            if (i + 1) % 100 == 0:
+                print(f"SIC {i + 1}/{len(todo)}")
+        known = pd.concat([known, pd.Series(new, name="sic")])
+        cache.mkdir(parents=True, exist_ok=True)
+        known.rename_axis("ticker").rename("sic").to_csv(f)
+    return known.reindex(list(tickers))
+
+
+# Fama-French 12 行业（按 SIC 区间），未覆盖的归入 Other
+FF12 = {
+    "NoDur": [(100, 999), (2000, 2399), (2700, 2749), (2770, 2799), (3100, 3199), (3940, 3989)],
+    "Durbl": [(2500, 2519), (2590, 2599), (3630, 3659), (3710, 3711), (3714, 3714), (3716, 3716), (3750, 3751),
+              (3792, 3792), (3900, 3939), (3990, 3999)],
+    "Manuf": [(2520, 2589), (2600, 2699), (2750, 2769), (3000, 3099), (3200, 3569), (3580, 3629), (3700, 3709),
+              (3712, 3713), (3715, 3715), (3717, 3749), (3752, 3791), (3793, 3799), (3830, 3839), (3860, 3899)],
+    "Enrgy": [(1200, 1399), (2900, 2999)],
+    "Chems": [(2800, 2829), (2840, 2899)],
+    "BusEq": [(3570, 3579), (3660, 3692), (3694, 3699), (3810, 3829), (7370, 7379)],
+    "Telcm": [(4800, 4899)],
+    "Utils": [(4900, 4949)],
+    "Shops": [(5000, 5999), (7200, 7299), (7600, 7699)],
+    "Hlth": [(2830, 2839), (3693, 3693), (3840, 3859), (8000, 8099)],
+    "Money": [(6000, 6999)],
+}
+
+
+def sic_to_ff12(sic: float) -> str | None:
+    if sic is None or not np.isfinite(sic):
+        return None
+    s = int(sic)
+    for name, ranges in FF12.items():
+        if any(lo <= s <= hi for lo, hi in ranges):
+            return name
+    return "Other"
+
+
+def industry_frame(sic: pd.Series, dates: pd.DatetimeIndex) -> pd.DataFrame:
+    """把 ticker -> SIC 变成行业宽表（每天相同），供 neutralize / 行业中性因子使用。"""
+    ind = sic.map(sic_to_ff12)
+    return pd.DataFrame([ind.to_numpy()] * len(dates), index=dates, columns=sic.index)
 
 
 def extract_records(facts: dict) -> pd.DataFrame:

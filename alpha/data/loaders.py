@@ -88,12 +88,14 @@ def market_from_yfinance(
 
 
 def download_yahoo_ohlcv(
-    tickers: list[str], cache: str | Path, refresh: bool = False, chunk: int = 50
+    tickers: list[str], cache: str | Path, refresh: bool = False, chunk: int = 50, start: str | None = None,
+    fields: tuple[str, ...] = ("open", "close", "adj_close", "volume", "splits"), dtype: str | None = None,
 ) -> dict[str, pd.DataFrame]:
     """分批下载 yfinance 日线，返回 {字段: 宽表}，并缓存到 pickle。
 
     字段：open / close（只做拆股调整）、adj_close（拆股 + 分红调整，用于算收益）、volume、splits。
     市值要用 close（不含分红调整）乘股本，否则历史市值会被未来分红压低。
+    start 为空时下载全部历史；股票很多时指定 start、只取需要的 fields 以节省内存。
     """
     cache = Path(cache)
     if cache.exists() and not refresh:
@@ -101,17 +103,19 @@ def download_yahoo_ohlcv(
     import yfinance as yf
 
     cols = {"open": "Open", "close": "Close", "adj_close": "Adj Close", "volume": "Volume", "splits": "Stock Splits"}
+    cols = {k: v for k, v in cols.items() if k in fields}
+    period = {"start": start} if start else {"period": "max"}
     parts: dict[str, list[pd.DataFrame]] = {k: [] for k in cols}
     for i in range(0, len(tickers), chunk):
         sub = tickers[i : i + chunk]
-        raw = yf.download(sub, period="max", interval="1d", auto_adjust=False, actions=True, progress=False,
+        raw = yf.download(sub, **period, interval="1d", auto_adjust=False, actions=True, progress=False,
                           group_by="column")
         for field, col in cols.items():
             if isinstance(raw.columns, pd.MultiIndex):
                 df = raw[col] if col in raw.columns.get_level_values(0) else pd.DataFrame(index=raw.index)
             else:
                 df = raw[[col]].rename(columns={col: sub[0]}) if col in raw.columns else pd.DataFrame(index=raw.index)
-            parts[field].append(df)
+            parts[field].append(df.astype(dtype) if dtype and field != "splits" else df)
         print(f"下载 {min(i + chunk, len(tickers))}/{len(tickers)}")
     out = {}
     for field, frames in parts.items():

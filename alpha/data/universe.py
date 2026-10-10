@@ -58,3 +58,39 @@ def snapshot_mask(
         if end > pos:
             mask.iloc[pos:end, mask.columns.get_indexer(members)] = True
     return mask
+
+
+def liquid_pool(dollar_volume: pd.DataFrame, n: int, window: int = 63, start: str | None = None) -> list[str]:
+    """月末按过去 window 日平均成交额排名，返回“曾进入前 n 名”的股票，用来缩小待下载基本面的范围。"""
+    adv = dollar_volume.rolling(window, min_periods=window // 2).mean()
+    me = adv.groupby(adv.index.to_period("M")).tail(1)
+    if start is not None:
+        me = me[me.index >= pd.Timestamp(start)]
+    ranks = me.rank(axis=1, ascending=False)
+    return sorted(ranks.columns[(ranks <= n).any()])
+
+
+def cap_rank_membership(
+    market_cap: pd.DataFrame,
+    n: int = 1000,
+    rank_month: int = 5,
+    start: str | None = None,
+) -> pd.DataFrame:
+    """仿罗素1000：每年 rank_month 月最后一个交易日按市值取前 n 名，从下个月末的快照起生效，持有一年。
+
+    只用排名日当天已知的市值（市值字段本身已按财报披露日对齐），返回每月末快照
+    (month_end_date, ticker)，交给 snapshot_mask 使用。
+    """
+    mcap = market_cap.dropna(how="all")
+    month_last = mcap.groupby(mcap.index.to_period("M")).tail(1).index
+    rank_dates = [d for d in month_last if d.month == rank_month]
+    rows = []
+    for d in month_last:
+        prior = [r for r in rank_dates if r.to_period("M") < d.to_period("M")]
+        if not prior:
+            continue
+        if start is not None and d < pd.Timestamp(start):
+            continue
+        top = mcap.loc[prior[-1]].dropna().nlargest(n).index
+        rows.extend((d, t) for t in top)
+    return pd.DataFrame(rows, columns=["month_end_date", "ticker"])
