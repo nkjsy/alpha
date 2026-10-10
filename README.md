@@ -12,7 +12,7 @@
 
 ```bash
 pip install -e ".[dev]"
-pytest -q                                       # 39 个测试，含端到端未来函数检查
+pytest -q                                       # 73 个测试，含端到端未来函数检查
 python -m alpha factors                         # 列出内置因子
 python -m alpha run configs/example_synthetic.yaml   # 用模拟数据跑完整流程
 ```
@@ -27,7 +27,8 @@ python -m alpha run configs/example_synthetic.yaml   # 用模拟数据跑完整�
 | 模块 | 作用 |
 |---|---|
 | `alpha/data/` | `MarketData` 宽表容器；CSV / yfinance 加载；历史成分股掩码；流动性过滤；模拟数据 |
-| `alpha/factors/` | 因子基类与注册表；内置价量因子（动量、反转、低波、彩票、规模、Amihud、低贝塔）与基本面因子模板 |
+| `alpha/factors/` | 因子基类与注册表；20 多个价量因子（见下表）与基本面因子模板 |
+| `alpha/mining.py` | 批量因子挖掘：增量 IC、BH 多重检验校正、前后半段稳定性、相关性去重的贪心挑选 |
 | `alpha/preprocess.py` | 股票池掩码、MAD/分位数去极值、zscore/排序标准化、行业与市值中性化 |
 | `alpha/evaluate.py` | Rank IC、ICIR、Newey-West t 值、分组收益与单调性、IC 衰减、排名自相关、因子相关性 |
 | `alpha/combine.py` | 等权、IC 加权、ICIR 加权（权重严格只用已实现的 IC） |
@@ -38,6 +39,7 @@ python -m alpha run configs/example_synthetic.yaml   # 用模拟数据跑完整�
 | `alpha/pipeline.py` | YAML 配置驱动的端到端流程与报告 |
 | `alpha/strategies/` | 具体策略，目前有纳指100动量 + QQQ 均线择时（Top3/Top10 切换） |
 | `scripts/nasdaq100_momentum.py` | 本地动量策略的迁移：原版复现与逐项修正对比 |
+| `scripts/mine_factors.py` | 纳指100历史成分上的因子挖掘与留出期检验 |
 
 ## 防过拟合的约定
 
@@ -62,6 +64,37 @@ python -m alpha run configs/example_synthetic.yaml   # 用模拟数据跑完整�
 - **复权价**：yfinance 的复权价按未来分红向前调整，收益率没问题，但价格水平（以及“价格 × 成交量”的成交额）会受未来信息影响。用成交额绝对阈值过滤时要留意。
 - **成分股重建**：历史成分表若是从当前成分反推，准确性取决于调整记录是否完整。
 
+## 内置因子
+
+| 类别 | 因子（`name`） | 文献 |
+|---|---|---|
+| 动量 | `momentum`、`resid_momentum`、`sharpe_momentum`、`info_continuity`、`high52w`、`ma_ratio`、`industry_momentum` | Jegadeesh-Titman 1993；Blitz-Huij-Martens 2011；Da-Gurun-Warachka 2014；George-Hwang 2004；Han-Zhou-Zhu 2016；Moskowitz-Grinblatt 1999 |
+| 反转 | `reversal`、`intraday_reversal` | Jegadeesh 1990；Lou-Polk-Skouras 2019 |
+| 隔夜 | `overnight_momentum` | Lou-Polk-Skouras 2019 |
+| 风险 | `low_vol`、`low_idio_vol`、`low_beta`、`max_ret`、`low_skew` | Ang et al. 2006；Frazzini-Pedersen 2014；Bali-Cakici-Whitelaw 2011；Boyer-Mitton-Vorkink 2010 |
+| 流动性/规模 | `amihud`、`size`、`abnormal_volume` | Amihud 2002；Banz 1981；Gervais-Kaniel-Mingelgrin 2001 |
+| 季节性 | `seasonality` | Heston-Sadka 2008 |
+| 价值 | `book_to_market`、`earnings_yield`、`sales_to_price`、`cfo_yield` | Fama-French 1992；Lakonishok-Shleifer-Vishny 1994 |
+| 盈利/质量 | `gross_profitability`、`operating_profitability`、`roe`、`low_accruals`、`low_leverage` | Novy-Marx 2013；Fama-French 2015；Sloan 1996 |
+| 投资/发行 | `low_asset_growth`、`low_net_issuance` | Cooper-Gulen-Schill 2008；Pontiff-Woodgate 2008 |
+| 成长/盈余 | `sales_growth`、`sue` | Bernard-Thomas 1989（财报后漂移） |
+
+基本面数据来自 SEC EDGAR XBRL（`alpha/data/sec.py`，免费）。为避免未来函数：每个报告期只用**首次披露**的值，按 SEC 提交日期（再滞后 1 个交易日）生效，后续重述不回填历史；TTM 由 4 个单季相加，Q4 用年报减前三季；市值 = 只做拆股调整的收盘价 × 按拆股换算的披露股本，不受分红复权影响。已退市公司不在 SEC 当前的 ticker 映射中，可通过 `extra_map` 手动补 CIK。
+
+## 因子挖掘
+
+`mine_factors` 在研究期上评估一批候选（不同参数各算一个候选），默认规则：
+
+- **增量 IC**：先对基准因子（如现有动量）做截面正交化，残差的 IC 才算新信息；
+- **多重检验**：BH 校正 q ≤ 0.05，同时要求 |t| ≥ 3（Harvey-Liu-Zhu 2016 的建议门槛）；
+- **稳定性**：研究期前后两半的增量 IC 同号；
+- **去冗余**：按增量 t 值从高到低入选，与已入选因子平均截面相关超过 0.6 的跳过；
+- **试验记账**：每个候选都写入 `experiments.jsonl`，参数网格越大，Deflated Sharpe 的惩罚越重。
+
+```bash
+python scripts/mine_factors.py --membership C:/money/fin/nasdaq/nasdaq100_monthly_constituents_backtest_2010_2026.csv
+```
+
 ## 新增一个因子
 
 ```python
@@ -69,9 +102,9 @@ python -m alpha run configs/example_synthetic.yaml   # 用模拟数据跑完整�
 from alpha.factors.base import Factor, register
 
 @register
-class High52w(Factor):
-    """距离 52 周高点：越接近高点越好（George & Hwang 2004）。"""
-    name = "high52w"
+class DistanceFromLow(Factor):
+    """距 52 周低点的涨幅。"""
+    name = "from_low52w"
 
     def __init__(self, window: int = 252):
         super().__init__(window=window)
@@ -79,10 +112,10 @@ class High52w(Factor):
 
     def compute(self, data):
         c = data.close
-        return c / c.rolling(self.window, min_periods=self.window // 2).max()
+        return c / c.rolling(self.window, min_periods=self.window // 2).min() - 1
 ```
 
-在 `alpha/factors/__init__.py` 中 import 该模块使其注册，然后在配置里写 `- {name: high52w, window: 252}`。
+在 `alpha/factors/__init__.py` 中 import 该模块使其注册，然后在配置里写 `- {name: from_low52w, window: 252}`。
 
 约定：返回与 `data.close` 同形状的宽表；值越大预期收益越高；只用 t 日及以前的数据。
 
@@ -118,4 +151,4 @@ python scripts/nasdaq100_momentum.py --membership C:/money/fin/nasdaq/nasdaq100_
 - yfinance 没有退市股，只适合快速原型；正式回测建议用含退市股的数据（CRSP、Norgate、Sharadar 等）。
 - 回测在收盘价成交，冲击成本为固定基点近似，未按成交额占比建模。
 - 组合构建是排序选股，尚未实现带风险模型的均值-方差优化（可在 `portfolio.py` 扩展）。
-- 基本面因子需要自备按披露日对齐的数据。
+- SEC 的 filed 日期通常晚于业绩发布日，盈余类因子偏保守；分析师预期、做空比例、期权隐含波动等数据尚未接入。

@@ -85,3 +85,48 @@ def market_from_yfinance(
     if membership_csv is not None:
         universe = membership_mask(load_membership_csv(membership_csv), close.index, close.columns)
     return MarketData(close=close, open=raw.get("Open"), volume=raw.get("Volume"), universe=universe)
+
+
+def download_yahoo_ohlcv(
+    tickers: list[str], cache: str | Path, refresh: bool = False, chunk: int = 50
+) -> dict[str, pd.DataFrame]:
+    """分批下载 yfinance 日线，返回 {字段: 宽表}，并缓存到 pickle。
+
+    字段：open / close（只做拆股调整）、adj_close（拆股 + 分红调整，用于算收益）、volume、splits。
+    市值要用 close（不含分红调整）乘股本，否则历史市值会被未来分红压低。
+    """
+    cache = Path(cache)
+    if cache.exists() and not refresh:
+        return pd.read_pickle(cache)
+    import yfinance as yf
+
+    cols = {"open": "Open", "close": "Close", "adj_close": "Adj Close", "volume": "Volume", "splits": "Stock Splits"}
+    parts: dict[str, list[pd.DataFrame]] = {k: [] for k in cols}
+    for i in range(0, len(tickers), chunk):
+        sub = tickers[i : i + chunk]
+        raw = yf.download(sub, period="max", interval="1d", auto_adjust=False, actions=True, progress=False,
+                          group_by="column")
+        for field, col in cols.items():
+            if isinstance(raw.columns, pd.MultiIndex):
+                df = raw[col] if col in raw.columns.get_level_values(0) else pd.DataFrame(index=raw.index)
+            else:
+                df = raw[[col]].rename(columns={col: sub[0]}) if col in raw.columns else pd.DataFrame(index=raw.index)
+            parts[field].append(df)
+        print(f"下载 {min(i + chunk, len(tickers))}/{len(tickers)}")
+    out = {}
+    for field, frames in parts.items():
+        df = pd.concat(frames, axis=1)
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+        out[field] = df.loc[:, ~df.columns.duplicated()].sort_index()
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    pd.to_pickle(out, cache)
+    return out
+
+
+def market_from_yahoo_raw(raw: dict[str, pd.DataFrame], universe: pd.DataFrame | None = None,
+                          fields: dict[str, pd.DataFrame] | None = None) -> MarketData:
+    """把 download_yahoo_ohlcv 的结果组装成 MarketData：收益用分红复权价，开盘价按同一比例复权。"""
+    adj = raw["adj_close"].dropna(how="all", axis=1)
+    ratio = adj / raw["close"].reindex_like(adj)
+    return MarketData(close=adj, open=raw["open"].reindex_like(adj) * ratio, volume=raw["volume"].reindex_like(adj),
+                      universe=universe, fields=fields or {})
