@@ -17,6 +17,8 @@ import urllib.request
 import pandas as pd
 
 WIKI_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+# 变更表有时被拆到单独页面
+HISTORY_URL = "https://en.wikipedia.org/wiki/Historical_components_of_the_S%26P_500"
 
 
 def normalize(t) -> str | None:
@@ -26,12 +28,30 @@ def normalize(t) -> str | None:
     return t or None
 
 
-def fetch_tables(url: str = WIKI_URL) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _read(url: str) -> list[pd.DataFrame]:
     req = urllib.request.Request(url, headers={"User-Agent": "alpha-research/0.1"})
     html = urllib.request.urlopen(req, timeout=60).read().decode("utf-8")
-    tables = pd.read_html(io.StringIO(html))
-    current = tables[0]
-    changes = tables[1]
+    return pd.read_html(io.StringIO(html))
+
+
+def _flat(cols) -> str:
+    return " ".join(str(x) for c in cols for x in (c if isinstance(c, tuple) else (c,))).lower()
+
+
+def _is_changes(t: pd.DataFrame) -> bool:
+    text = _flat(t.columns)
+    return "added" in text and "removed" in text and "date" in text
+
+
+def fetch_tables() -> tuple[pd.DataFrame, pd.DataFrame]:
+    """返回 (当前成分表, 变更表)。按列名识别表格，主页面找不到变更表时去历史成分页面找。"""
+    tables = _read(WIKI_URL)
+    current = next(t for t in tables if any(str(c).lower() in ("symbol", "ticker") for c in t.columns))
+    changes = next((t for t in tables if _is_changes(t)), None)
+    if changes is None:
+        changes = next((t for t in _read(HISTORY_URL) if _is_changes(t)), None)
+    if changes is None:
+        raise RuntimeError("在维基百科页面上找不到标普500成分变更表，页面结构可能又变了")
     return current, changes
 
 
