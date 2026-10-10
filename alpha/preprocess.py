@@ -15,10 +15,13 @@ def apply_universe(df: pd.DataFrame, universe: pd.DataFrame) -> pd.DataFrame:
 
 
 def winsorize_mad(df: pd.DataFrame, n: float = 5.0) -> pd.DataFrame:
-    """中位数绝对偏差去极值：截断到 median ± n * 1.4826 * MAD。"""
+    """中位数绝对偏差去极值：截断到 median ± n * 1.4826 * MAD。
+
+    超过一半取同一个值时 MAD 为 0（如大多数股票没有内部人买入），此时不截断，否则整个截面会被压成常数。
+    """
     med = df.median(axis=1)
-    mad = df.sub(med, axis=0).abs().median(axis=1) * 1.4826
-    lo, hi = med - n * mad, med + n * mad
+    mad = (df.sub(med, axis=0).abs().median(axis=1) * 1.4826).replace(0, np.nan)
+    lo, hi = (med - n * mad).fillna(-np.inf), (med + n * mad).fillna(np.inf)
     return df.clip(lower=lo, upper=hi, axis=0)
 
 
@@ -88,6 +91,19 @@ def fill_missing(df: pd.DataFrame, universe: pd.DataFrame, value: float = 0.0) -
     """池内但因子缺失的股票填一个中性值（标准化后用 0）。"""
     u = universe.reindex_like(df).fillna(False).astype(bool)
     return df.where(~u | df.notna(), value).where(u)
+
+
+def group_demean(df: pd.DataFrame, groups: pd.DataFrame) -> pd.DataFrame:
+    """逐日减去所在行业的均值（行业中性），无行业的股票置为 NaN。"""
+    g = groups.reindex_like(df)
+    out = pd.DataFrame(np.nan, index=df.index, columns=df.columns)
+    for val in pd.unique(g.to_numpy().ravel()):
+        if pd.isna(val):
+            continue
+        m = g == val
+        x = df.where(m)
+        out = out.where(~m, x.sub(x.mean(axis=1), axis=0))
+    return out
 
 
 def standard_pipeline(

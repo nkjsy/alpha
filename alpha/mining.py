@@ -51,13 +51,18 @@ def benjamini_hochberg(p: pd.Series) -> pd.Series:
     return pd.Series(q, index=order.index).reindex(p.index)
 
 
-def build_candidates(specs: list[str | dict], data: MarketData) -> dict[str, pd.DataFrame]:
-    """计算原始因子值；缺数据的因子（如没有 open）跳过并提示。"""
+def build_candidates(specs: list[str | dict], data: MarketData,
+                     dates: pd.DatetimeIndex | None = None) -> dict[str, pd.DataFrame]:
+    """计算原始因子值；缺数据的因子（如没有 open）跳过并提示。
+
+    dates 不为空时只保留这些日期（如月末调仓日），股票多时能省下大量内存。
+    """
     out = {}
     for spec in specs:
         f = build_factor(spec)
         try:
-            out[f.label] = f.compute(data)
+            x = f.compute(data)
+            out[f.label] = x.reindex(dates) if dates is not None else x
         except (ValueError, KeyError) as e:
             print(f"跳过 {f.label}：{e}")
     return out

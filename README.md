@@ -78,6 +78,9 @@ python -m alpha run configs/example_synthetic.yaml   # 用模拟数据跑完整�
 | 盈利/质量 | `gross_profitability`、`operating_profitability`、`roe`、`low_accruals`、`low_leverage` | Novy-Marx 2013；Fama-French 2015；Sloan 1996 |
 | 投资/发行 | `low_asset_growth`、`low_net_issuance` | Cooper-Gulen-Schill 2008；Pontiff-Woodgate 2008 |
 | 成长/盈余 | `sales_growth`、`sue` | Bernard-Thomas 1989（财报后漂移） |
+| 综合质量 | `quality_composite` | Asness-Frazzini-Pedersen 2019（QMJ） |
+| 内部人 | `insider_net_ratio`、`insider_buyers` | Lakonishok-Lee 2001；Cohen-Malloy-Pomorski 2012 |
+| 机构持仓 | `inst_breadth_chg` | Chen-Hong-Stein 2002 |
 
 基本面数据来自 SEC EDGAR XBRL（`alpha/data/sec.py`，免费）。为避免未来函数：每个报告期只用**首次披露**的值，按 SEC 提交日期（再滞后 1 个交易日）生效，后续重述不回填历史；TTM 由 4 个单季相加，Q4 用年报减前三季；市值 = 只做拆股调整的收盘价 × 按拆股换算的披露股本，不受分红复权影响。已退市公司不在 SEC 当前的 ticker 映射中，可通过 `extra_map` 手动补 CIK。
 
@@ -101,6 +104,22 @@ python scripts/mine_factors.py --membership data/sp500_monthly_constituents.csv 
 ```
 
 纳指100只有约 100 只股票，131 个月的研究期里月度 IC 要超过约 0.035 才能达到 t=3，文献中多数因子在这个池子里检验力不够。
+
+### 近似罗素1000 + 行业中性 + 另类数据
+
+```bash
+# 1. 用 SEC 挂牌公司 + 标普500历史成分做候选池，按市值每年 5 月末取前 1000 名
+python scripts/build_r1000_universe.py --extra-membership data/sp500_monthly_constituents.csv --sec-user-agent "名字 邮箱"
+# 2. 挖掘：加行业中性版本、内部人交易、13F 机构持仓，并在标普500子池内复核
+python scripts/mine_factors.py --membership data/r1000_monthly_constituents.csv --cache data/cache/r1000_yahoo_raw.pkl \
+    --industry --insider --inst --sub-membership data/sp500_monthly_constituents.csv --out output/factor_mining_r1000
+```
+
+- **行业中性**（`--industry`）：SEC 登记的 SIC 代码映射到 Fama-French 12 行业，对价值/质量因子额外评估行业内去均值的版本（后缀 `|ind`）。SIC 是当前值，不是历史时点值。
+- **内部人**（`--insider`）：SEC Insider Transactions Data Sets，只用原始 Form 4 中的公开市场买入（P）/卖出（S），按提交日 + 1 个交易日生效，窗口半年。
+- **机构持仓**（`--inst`）：SEC Form 13F Data Sets（2013 年起），只统计在截止日（季末 + 45 天）前提交的原始 13F-HR，截止日后才生效；CUSIP 通过 SEC fails-to-deliver 数据对照成 ticker。
+- **子池复核**（`--sub-membership`）：输出 `ic_incr_sub`/`t_incr_sub`，看因子在你实际交易的股票（如标普500）里是否同样有效。
+- 近似罗素1000的候选池缺少“不在标普500且已退市”的公司，仍有幸存者偏差；每次重跑请换新的 `--out`，否则试验次数会累加。
 
 ## 新增一个因子
 
