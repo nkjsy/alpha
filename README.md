@@ -93,7 +93,14 @@ python -m alpha run configs/example_synthetic.yaml   # 用模拟数据跑完整�
 
 ```bash
 python scripts/mine_factors.py --membership C:/money/fin/nasdaq/nasdaq100_monthly_constituents_backtest_2010_2026.csv
+
+# 标普500：先用维基百科的成分变更记录重建月末历史成分
+python scripts/build_sp500_membership.py --out data/sp500_monthly_constituents.csv
+python scripts/mine_factors.py --membership data/sp500_monthly_constituents.csv \
+    --cache data/cache/sp500_yahoo_raw.pkl --out output/factor_mining_sp500
 ```
+
+纳指100只有约 100 只股票，131 个月的研究期里月度 IC 要超过约 0.035 才能达到 t=3，文献中多数因子在这个池子里检验力不够。
 
 ## 新增一个因子
 

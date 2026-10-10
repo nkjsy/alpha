@@ -207,7 +207,10 @@ def ttm(rec: pd.DataFrame) -> pd.DataFrame:
     a = annual(rec)
     if len(out):
         a = a[~a["end"].isin(out["end"])]
-    return pd.concat([out, a], ignore_index=True).sort_values("end").reset_index(drop=True)
+    parts = [p for p in (out, a) if len(p)]
+    if not parts:
+        return out
+    return pd.concat(parts, ignore_index=True).sort_values("end").reset_index(drop=True)
 
 
 def instant(rec: pd.DataFrame) -> pd.DataFrame:
