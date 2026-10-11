@@ -8,3 +8,4 @@ output/
 *.ipynb_checkpoints
 mlruns/
 tmp/
+data/qlib_us/
