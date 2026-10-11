@@ -42,6 +42,8 @@ def build(raw: dict[str, pd.DataFrame], records: dict[str, pd.DataFrame], n: int
     if "market_cap" not in fields:
         raise RuntimeError("SEC 记录里没有股本数据，无法计算市值")
     adv = (close * raw["volume"].astype(float)).rolling(63, min_periods=21).mean()
+    # 只用有 SEC 财报的公司补位（排除 SPY 之类的基金/ETF，它们成交额很大但不该进股票池）
+    adv = adv[[t for t in adv.columns if t in records and len(records[t])]]
     mem = cap_rank_membership(fields["market_cap"], n=n, start=start, fallback=adv, always=always)
     return mem, fields["market_cap"]
 
@@ -98,8 +100,20 @@ def main() -> None:
 
     cmap = fetch_ticker_map(args.sec_user_agent, args.sec_cache)
     events = fetch_insider_events(2009, raw["close"].index[-1], args.sec_user_agent, args.sec_cache)
-    old = {t: c for t, c in historical_ciks(events, cmap).items() if t in set(liquid)}
-    print(f"用 Form 4 找到换过 CIK 的 {len(old)} 只，补回旧 CIK 的历史财报：{', '.join(sorted(old)[:30])}{' ...' if len(old) > 30 else ''}")
+    cand = {t: c for t, c in historical_ciks(events, cmap).items() if t in set(liquid)}
+    base = fetch_records(liquid, args.sec_user_agent, args.sec_cache)
+    # 只有“股价历史比当前 CIK 的首份财报早一年以上”的才合并旧 CIK：这是公司重组换了申报主体（如 XOM）。
+    # 反之是 ticker 被另一家新公司重新使用，旧 CIK 属于别的公司，不能并进来。
+    first_px = sub["close"].apply(lambda s: s.first_valid_index())
+    old = {}
+    for t, c in cand.items():
+        rec = base.get(t)
+        if rec is None or rec.empty or pd.isna(first_px.get(t)):
+            continue
+        if first_px[t] < rec["filed"].min() - pd.Timedelta(days=365):
+            old[t] = c
+    print(f"Form 4 里换过 CIK 的 {len(cand)} 只，其中判定为同一公司重组、合并旧 CIK 财报的 {len(old)} 只："
+          f"{', '.join(sorted(old))}")
     records = fetch_records(liquid, args.sec_user_agent, args.sec_cache, extra_ciks=old)
     always = None
     if extra is not None:

@@ -265,7 +265,9 @@ def fetch_records(
                     continue
             extra.append(pd.read_pickle(f))
         if extra:
-            out[t] = pd.concat([*extra, out.get(t, pd.DataFrame())], ignore_index=True)
+            frames = [x for x in [*extra, out.get(t)] if x is not None and len(x)]
+            if frames:
+                out[t] = pd.concat(frames, ignore_index=True)
     if missing:
         print(f"SEC 找不到 CIK 的 ticker {len(missing)} 只（多为已退市）：{', '.join(missing)}")
     return out
