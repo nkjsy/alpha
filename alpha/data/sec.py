@@ -64,11 +64,19 @@ CONCEPTS: dict[str, tuple[str, list[tuple[str, str, str]]]] = {
         ("us-gaap", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest", "USD"),
     ]),
     "liabilities": ("instant", [("us-gaap", "Liabilities", "USD")]),
+    # 多类股公司（V、META、GOOGL 等）的分类别股本是带维度的数据，companyfacts 接口不提供，
+    # 前两个 tag 往往缺失，此时退而用加权平均股本（全部类别合计）
     "shares": ("instant", [
         ("dei", "EntityCommonStockSharesOutstanding", "shares"),
         ("us-gaap", "CommonStockSharesOutstanding", "shares"),
+        ("us-gaap", "WeightedAverageNumberOfDilutedSharesOutstanding", "shares"),
+        ("us-gaap", "WeightedAverageNumberOfSharesOutstandingBasic", "shares"),
     ]),
 }
+
+# 这些字段的低优先级 tag 只用来填补高优先级 tag 覆盖不到的时段，不与之穿插（口径不同，穿插会来回跳）
+GAP_FILL_FIELDS = {"shares"}
+GAP_DAYS = 200
 
 QUARTER_DAYS = (75, 105)
 ANNUAL_DAYS = (340, 390)
@@ -209,9 +217,13 @@ def extract_records(facts: dict) -> pd.DataFrame:
 
 def fetch_records(
     tickers: Iterable[str], user_agent: str, cache_dir: str | Path, extra_map: dict[str, int] | None = None,
-    refresh: bool = False, sleep: float = 0.12,
+    refresh: bool = False, sleep: float = 0.12, extra_ciks: dict[str, list[int]] | None = None,
 ) -> dict[str, pd.DataFrame]:
-    """逐个 ticker 下载并抽取记录，结果按 ticker 缓存为小 pickle。"""
+    """逐个 ticker 下载并抽取记录，结果按 ticker 缓存为小 pickle。
+
+    extra_ciks 为 {ticker: [旧 CIK]}：公司重组成新的控股公司后，SEC 的 ticker 映射只指向新 CIK
+    （如 XOM），旧 CIK 下的历史财报要另外下载再合并。见 historical_ciks。
+    """
     cache = Path(cache_dir)
     cache.mkdir(parents=True, exist_ok=True)
     cmap = fetch_ticker_map(user_agent, cache)
@@ -238,8 +250,45 @@ def fetch_records(
         time.sleep(sleep)
         if (i + 1) % 25 == 0:
             print(f"SEC {i + 1}")
+    for t, ciks in (extra_ciks or {}).items():
+        if t not in out and t not in cmap:
+            continue
+        extra = []
+        for cik in ciks:
+            f = cache / f"{t}__{cik}.pkl"
+            if not f.exists() or refresh:
+                try:  # pragma: no cover - network
+                    extract_records(_get_json(FACTS_URL.format(cik=cik), user_agent)).to_pickle(f)
+                    time.sleep(sleep)
+                except Exception as e:  # pragma: no cover - network
+                    print(f"SEC 下载失败 {t}（旧 CIK {cik}）：{e}")
+                    continue
+            extra.append(pd.read_pickle(f))
+        if extra:
+            out[t] = pd.concat([*extra, out.get(t, pd.DataFrame())], ignore_index=True)
     if missing:
         print(f"SEC 找不到 CIK 的 ticker {len(missing)} 只（多为已退市）：{', '.join(missing)}")
+    return out
+
+
+def historical_ciks(events: pd.DataFrame, cmap: dict[str, int]) -> dict[str, list[int]]:
+    """从 Form 4 记录（发行人代码 + CIK）找出“同一 ticker 以前用过的其它 CIK”。
+
+    排除仍是其它现存 ticker 当前 CIK 的（那是另一家还在交易的公司，ticker 被重新分配过）。
+    """
+    if events is None or events.empty:
+        return {}
+    pairs = events.dropna(subset=["cik"]).assign(cik=lambda d: d["cik"].astype(int))
+    pairs = pairs[pairs["symbol"] != ""].groupby(["symbol", "cik"])["filed"].max().reset_index()
+    current = set(cmap.values())
+    out: dict[str, list[int]] = {}
+    for sym, g in pairs.groupby("symbol"):
+        cur = cmap.get(sym)
+        if cur is None:
+            continue
+        old = [int(c) for c in g.sort_values("filed")["cik"] if c != cur and c not in current]
+        if old:
+            out[sym] = old
     return out
 
 
@@ -320,8 +369,11 @@ def sue(rec: pd.DataFrame, window: int = 8, min_obs: int = 4) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["end", "val", "filed"])
 
 
-def _combine_tags(rec: pd.DataFrame, builder) -> pd.DataFrame:
-    """按优先级对各个 tag 分别构建序列，再按 end 合并（同一 end 取高优先级 tag）。"""
+def _combine_tags(rec: pd.DataFrame, builder, gap_fill: bool = False) -> pd.DataFrame:
+    """按优先级对各个 tag 分别构建序列，再按 end 合并（同一 end 取高优先级 tag）。
+
+    gap_fill=True 时，低优先级 tag 的记录只在距离所有更高优先级记录都超过 GAP_DAYS 天时才使用。
+    """
     parts = []
     for prio, g in rec.groupby("prio"):
         s = builder(g)
@@ -329,6 +381,17 @@ def _combine_tags(rec: pd.DataFrame, builder) -> pd.DataFrame:
             parts.append(s.assign(prio=prio))
     if not parts:
         return pd.DataFrame(columns=["end", "val", "filed"])
+    if gap_fill:
+        kept = [parts[0]]
+        for p in parts[1:]:
+            ends = pd.concat(kept)["end"].sort_values().to_numpy()
+            pos = np.searchsorted(ends, p["end"].to_numpy())
+            prev = np.where(pos > 0, ends[np.maximum(pos - 1, 0)], np.datetime64("NaT", "ns"))
+            nxt = np.where(pos < len(ends), ends[np.minimum(pos, len(ends) - 1)], np.datetime64("NaT", "ns"))
+            gap = np.timedelta64(GAP_DAYS, "D")
+            far = ~((p["end"].to_numpy() - prev) <= gap) & ~((nxt - p["end"].to_numpy()) <= gap)
+            kept.append(p[far])
+        parts = kept
     allp = pd.concat(parts).sort_values(["end", "prio"])
     return allp.drop_duplicates("end", keep="first")[["end", "val", "filed"]].reset_index(drop=True)
 
@@ -340,7 +403,7 @@ def point_in_time_series(records: dict[str, pd.DataFrame]) -> dict[str, pd.DataF
     for t, rec in records.items():
         for field, g in rec.groupby("field"):
             kind = CONCEPTS[field][0]
-            s = _combine_tags(g, builders[kind])
+            s = _combine_tags(g, builders[kind], gap_fill=field in GAP_FILL_FIELDS)
             name = f"{field}_ttm" if kind == "flow" else field
             if len(s):
                 out.setdefault(name, []).append(s.assign(ticker=t))
@@ -399,6 +462,11 @@ def build_fields(
             df, dates, tickers, "val", lag_days=lag_days,
             max_staleness=sue_staleness if name == "sue" else max_staleness,
         )
+    if {"net_income_ttm", "eps_ttm"} <= fields.keys():
+        # 仍缺股本时用 净利润 / 每股收益 反推（如 Visa 连加权平均股本都只有分类别数据）
+        eps = fields["eps_ttm"].where(fields["eps_ttm"].abs() > 0.05)
+        implied = (fields["net_income_ttm"] / eps).where(lambda x: x > 0)
+        fields["shares"] = fields["shares"].combine_first(implied) if "shares" in fields else implied
     if "shares" in fields:
         fields["market_cap"] = close_split_adj.reindex(index=dates, columns=tickers) * fields["shares"]
     if "equity" in fields:

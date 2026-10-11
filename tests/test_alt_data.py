@@ -159,3 +159,47 @@ def test_yahoo_download_resumes_from_chunk_cache(tmp_path, monkeypatch):
     assert calls == [["A", "B"], ["C", "D"], ["C", "D"]]          # 第一批没有重新下载
     assert list(out["close"].columns) == tickers and cache.exists()
     assert not (tmp_path / "raw_parts").exists()
+
+
+def _rec(rows):
+    df = pd.DataFrame(rows, columns=["field", "prio", "tag", "start", "end", "val", "filed", "form"])
+    for c in ("start", "end", "filed"):
+        df[c] = pd.to_datetime(df[c])
+    return df
+
+
+def test_shares_fall_back_to_weighted_average_without_interleaving():
+    from alpha.data.sec import point_in_time_series
+
+    rec = _rec([
+        ("shares", 0, "dei", None, "2015-01-31", 100.0, "2015-02-20", "10-K"),
+        ("shares", 0, "dei", None, "2015-04-30", 101.0, "2015-05-10", "10-Q"),
+        ("shares", 2, "wavg", "2015-01-01", "2015-03-31", 150.0, "2015-05-10", "10-Q"),   # 紧挨着 dei，不用
+        ("shares", 2, "wavg", "2016-07-01", "2016-09-30", 160.0, "2016-11-01", "10-Q"),   # dei 断档后才用
+    ])
+    s = point_in_time_series({"X": rec})["shares"].set_index("end")["val"]
+    assert 150.0 not in s.values and s.loc[pd.Timestamp("2016-09-30")] == 160.0
+
+
+def test_historical_ciks_from_form4():
+    from alpha.data.sec import historical_ciks
+
+    ev = pd.DataFrame({"cik": [34088, 2115436, 111, 222], "symbol": ["XOM", "XOM", "ABC", "ABC"],
+                       "filed": pd.to_datetime(["2020-01-01", "2025-01-01", "2012-01-01", "2020-01-01"])})
+    cmap = {"XOM": 2115436, "ABC": 222, "DEF": 111}   # 111 现在是另一家公司的 CIK，不能并进来
+    assert historical_ciks(ev, cmap) == {"XOM": [34088]}
+
+
+def test_cap_rank_fallback_and_forced_members():
+    dates = pd.bdate_range("2010-01-01", "2011-12-31")
+    mcap = pd.DataFrame(np.nan, index=dates, columns=["a", "b", "c", "d"])
+    mcap.loc["2011-01-01":, ["a", "b"]] = [2.0, 1.0]
+    adv = pd.DataFrame({"a": 1.0, "b": 1.0, "c": 5.0, "d": 3.0}, index=dates)
+    always = pd.DataFrame({"month_end_date": ["2010-07-30"], "ticker": ["d"]})
+    mem = cap_rank_membership(mcap, n=2, fallback=adv, always=always)
+    jun10 = set(mem.loc[mem["month_end_date"] == pd.Timestamp("2010-06-30"), "ticker"])
+    jul10 = set(mem.loc[mem["month_end_date"] == pd.Timestamp("2010-07-30"), "ticker"])
+    jun11 = set(mem.loc[mem["month_end_date"] == pd.Timestamp("2011-06-30"), "ticker"])
+    assert jun10 == {"c", "d"}          # 2010-05 没有市值，按成交额补足
+    assert jul10 == {"c", "d"}
+    assert jun11 == {"a", "b"}

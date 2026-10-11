@@ -5,6 +5,13 @@
 2. 用 Yahoo 价格和成交额先粗筛：月末过去 63 日平均成交额曾进入前 1500 名的股票；
 3. 对粗筛结果用 SEC 披露的股本（按披露日对齐）乘当时价格得到市值，每年 5 月末取前 1000 名。
 
+补救措施：
+- 多类股公司的股本依次退用 加权平均股本 -> 净利润 / EPS 反推（见 alpha/data/sec.py）；
+- 重组成新控股公司、SEC 映射换了 CIK 的（如 XOM），用 Form 4 记录里的旧 CIK 补回历史财报；
+- 大批下载超时丢掉的价格用小批次重下；
+- 2009–2010 年 XBRL 尚未普及、有市值的股票不足 1000 只时，用平均成交额补足；
+- 额外成分表（标普500）里的股票当月一定纳入。
+
 局限：候选池缺少“既不在标普500、又已经退市”的公司，存在一定幸存者偏差；
 外国公司（报 IFRS、无 us-gaap 股本）没有市值，会被排除，这一点和罗素的规则大体一致。
 
@@ -21,18 +28,37 @@ from pathlib import Path
 
 import pandas as pd
 
-from alpha.data.loaders import download_yahoo_ohlcv
-from alpha.data.sec import build_fields, fetch_listed_companies, fetch_records
+from alpha.data.insider import fetch_insider_events
+from alpha.data.loaders import download_yahoo_ohlcv, fill_missing_yahoo
+from alpha.data.sec import build_fields, fetch_listed_companies, fetch_records, fetch_ticker_map, historical_ciks
 from alpha.data.universe import cap_rank_membership, liquid_pool
 
 
-def build(raw: dict[str, pd.DataFrame], records: dict[str, pd.DataFrame], n: int, start: str) -> pd.DataFrame:
+def build(raw: dict[str, pd.DataFrame], records: dict[str, pd.DataFrame], n: int, start: str,
+          always: pd.DataFrame | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     close = raw["close"].astype(float)
     tickers = close.columns
     fields = build_fields(records, close.index, tickers, close, raw.get("splits"))
     if "market_cap" not in fields:
         raise RuntimeError("SEC 记录里没有股本数据，无法计算市值")
-    return cap_rank_membership(fields["market_cap"], n=n, start=start)
+    adv = (close * raw["volume"].astype(float)).rolling(63, min_periods=21).mean()
+    mem = cap_rank_membership(fields["market_cap"], n=n, start=start, fallback=adv, always=always)
+    return mem, fields["market_cap"]
+
+
+def overlap_report(extra: pd.DataFrame, mem: pd.DataFrame, mcap: pd.DataFrame) -> None:
+    """额外成分表（标普500）里有市值的比例，反映市值数据的覆盖质量（强制纳入之前）。"""
+    e = extra.assign(month=pd.to_datetime(extra["month_end_date"]).dt.to_period("M"))
+    e = e[e["month"] >= pd.to_datetime(mem["month_end_date"]).min().to_period("M")]
+    last = mcap.groupby(mcap.index.to_period("M")).last()
+    has = last.notna()
+    e = e[e["month"].isin(has.index)]
+    e["has_cap"] = [bool(has.at[m, t]) if t in has.columns else False for m, t in zip(e["month"], e["ticker"])]
+    by_year = e.groupby(e["month"].dt.year)["has_cap"].mean()
+    print("额外成分表中有市值的比例（按年）：" + "，".join(f"{y} {v:.0%}" for y, v in by_year.items()))
+    recent = e[e["month"] == e["month"].max()]
+    miss = sorted(recent.loc[~recent["has_cap"], "ticker"])
+    print(f"最新一期额外成分表里没有市值的（已强制纳入）{len(miss)} 只：{', '.join(miss)}")
 
 
 def main() -> None:
@@ -60,26 +86,39 @@ def main() -> None:
     print(f"候选池 {len(pool)} 只（交易所挂牌 {len(listed)}）")
 
     raw = download_yahoo_ohlcv(pool, args.pool_cache, start=args.price_start, dtype="float32")
+    n_before = raw["close"].dropna(how="all", axis=1).shape[1]
+    raw, still = fill_missing_yahoo(raw, pool, start=args.price_start, dtype="float32")
+    if raw["close"].dropna(how="all", axis=1).shape[1] > n_before:
+        pd.to_pickle(raw, args.pool_cache)
+    print(f"有价格的 {raw['close'].dropna(how='all', axis=1).shape[1]} 只，仍缺 {len(still)} 只（多为已退市）")
     dv = (raw["close"].astype(float) * raw["volume"].astype(float))
     liquid = liquid_pool(dv, args.pool_n, start=pd.Timestamp(args.start) - pd.DateOffset(months=8))
     print(f"成交额曾进前 {args.pool_n} 名：{len(liquid)} 只")
     sub = {k: v.reindex(columns=liquid).astype(float) for k, v in raw.items()}
 
-    records = fetch_records(liquid, args.sec_user_agent, args.sec_cache)
-    mem = build(sub, records, args.n, args.start)
+    cmap = fetch_ticker_map(args.sec_user_agent, args.sec_cache)
+    events = fetch_insider_events(2009, raw["close"].index[-1], args.sec_user_agent, args.sec_cache)
+    old = {t: c for t, c in historical_ciks(events, cmap).items() if t in set(liquid)}
+    print(f"用 Form 4 找到换过 CIK 的 {len(old)} 只，补回旧 CIK 的历史财报：{', '.join(sorted(old)[:30])}{' ...' if len(old) > 30 else ''}")
+    records = fetch_records(liquid, args.sec_user_agent, args.sec_cache, extra_ciks=old)
+    always = None
+    if extra is not None:
+        always = extra[extra["ticker"].isin(sub["close"].dropna(how="all", axis=1).columns)]
+    mem, mcap = build(sub, records, args.n, args.start, always=always)
     members = sorted(mem["ticker"].unique())
     per_month = mem.groupby("month_end_date").size()
     print(f"成分表 {mem['month_end_date'].min():%Y-%m} ~ {mem['month_end_date'].max():%Y-%m}，"
           f"每月 {per_month.min()}~{per_month.max()} 只，共出现 {len(members)} 只")
     if extra is not None:
-        e = extra.assign(month_end_date=pd.to_datetime(extra["month_end_date"]))
-        e = e[e["month_end_date"] >= mem["month_end_date"].min()]
-        hit = e.merge(mem.assign(month_end_date=pd.to_datetime(mem["month_end_date"])), on=["month_end_date", "ticker"])
-        print(f"额外成分表的月度记录中，有 {len(hit) / max(len(e), 1):.1%} 也在近似罗素1000里")
+        overlap_report(extra, mem, mcap)
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     mem.to_csv(args.out, index=False, date_format="%Y-%m-%d")
     keep = {k: v.reindex(columns=members) for k, v in sub.items()}
+    if "high" not in keep:  # 旧版缓存没有高低价，qlib 的 Alpha158 需要
+        hl = download_yahoo_ohlcv(members, Path(args.yahoo_out).with_name("r1000_high_low.pkl"),
+                                  start=args.price_start, fields=("high", "low"))
+        keep.update({k: hl[k].reindex(index=keep["close"].index, columns=members).astype(float) for k in ("high", "low")})
     Path(args.yahoo_out).parent.mkdir(parents=True, exist_ok=True)
     pd.to_pickle(keep, args.yahoo_out)
     print(f"已写入 {args.out} 和 {args.yahoo_out}")

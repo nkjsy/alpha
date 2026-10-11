@@ -91,11 +91,12 @@ def market_from_yfinance(
 
 def download_yahoo_ohlcv(
     tickers: list[str], cache: str | Path, refresh: bool = False, chunk: int = 50, start: str | None = None,
-    fields: tuple[str, ...] = ("open", "close", "adj_close", "volume", "splits"), dtype: str | None = None,
+    fields: tuple[str, ...] = ("open", "high", "low", "close", "adj_close", "volume", "splits"),
+    dtype: str | None = None,
 ) -> dict[str, pd.DataFrame]:
     """分批下载 yfinance 日线，返回 {字段: 宽表}，并缓存到 pickle。
 
-    字段：open / close（只做拆股调整）、adj_close（拆股 + 分红调整，用于算收益）、volume、splits。
+    字段：open / high / low / close（只做拆股调整）、adj_close（拆股 + 分红调整，用于算收益）、volume、splits。
     市值要用 close（不含分红调整）乘股本，否则历史市值会被未来分红压低。
     start 为空时下载全部历史；股票很多时指定 start、只取需要的 fields 以节省内存。
     每批下载完先存到 <cache>_parts/ 目录，中途断了重跑会跳过已完成的批次，全部完成后再合并。
@@ -105,7 +106,8 @@ def download_yahoo_ohlcv(
         return pd.read_pickle(cache)
     import yfinance as yf
 
-    cols = {"open": "Open", "close": "Close", "adj_close": "Adj Close", "volume": "Volume", "splits": "Stock Splits"}
+    cols = {"open": "Open", "high": "High", "low": "Low", "close": "Close", "adj_close": "Adj Close",
+            "volume": "Volume", "splits": "Stock Splits"}
     cols = {k: v for k, v in cols.items() if k in fields}
     period = {"start": start} if start else {"period": "max"}
     parts: dict[str, list[pd.DataFrame]] = {k: [] for k in cols}
@@ -140,6 +142,52 @@ def download_yahoo_ohlcv(
     pd.to_pickle(out, cache)
     shutil.rmtree(part_dir, ignore_errors=True)
     return out
+
+
+def fill_missing_yahoo(raw: dict[str, pd.DataFrame], tickers: list[str], chunk: int = 10, retries: int = 2,
+                       start: str | None = None, dtype: str | None = None) -> tuple[dict[str, pd.DataFrame], list[str]]:
+    """对完全没有价格的 ticker 用更小的批次重新下载（大批下载偶尔超时，整批都会丢）。
+
+    返回 (补齐后的 raw, 仍然缺失的 ticker)；仍缺失的多为已退市、Yahoo 本来就没有的股票。
+    """
+    import yfinance as yf
+
+    cols = {"open": "Open", "high": "High", "low": "Low", "close": "Close", "adj_close": "Adj Close",
+            "volume": "Volume", "splits": "Stock Splits"}
+    cols = {k: v for k, v in cols.items() if k in raw}
+    period = {"start": start} if start else {"period": "max"}
+    have = raw["close"].dropna(how="all", axis=1).columns
+    todo = [t for t in tickers if t not in have]
+    for attempt in range(retries):
+        if not todo:
+            break
+        got: dict[str, list[pd.DataFrame]] = {k: [] for k in cols}
+        for i in range(0, len(todo), chunk):
+            sub = todo[i : i + chunk]
+            try:
+                df = yf.download(sub, **period, interval="1d", auto_adjust=False, actions=True, progress=False,
+                                 group_by="column", timeout=30)
+            except Exception as e:
+                print(f"补下载失败 {sub}：{e}")
+                continue
+            for field, col in cols.items():
+                if isinstance(df.columns, pd.MultiIndex):
+                    part = df[col] if col in df.columns.get_level_values(0) else pd.DataFrame(index=df.index)
+                else:
+                    part = df[[col]].rename(columns={col: sub[0]}) if col in df.columns else pd.DataFrame(index=df.index)
+                got[field].append(part.astype(dtype) if dtype and field != "splits" else part)
+        for field, frames in got.items():
+            if not frames:
+                continue
+            new = pd.concat(frames, axis=1)
+            new.index = pd.to_datetime(new.index).tz_localize(None)
+            new = new.loc[:, ~new.columns.duplicated()].dropna(how="all", axis=1)
+            base = raw[field].drop(columns=[c for c in new.columns if c in raw[field].columns])
+            raw[field] = pd.concat([base, new], axis=1).sort_index()
+        have = raw["close"].dropna(how="all", axis=1).columns
+        todo = [t for t in todo if t not in have]
+        print(f"补下载第 {attempt + 1} 轮后仍缺 {len(todo)} 只")
+    return raw, todo
 
 
 def market_from_yahoo_raw(raw: dict[str, pd.DataFrame], universe: pd.DataFrame | None = None,

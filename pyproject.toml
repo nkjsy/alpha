@@ -16,6 +16,7 @@ dependencies = [
 
 [project.optional-dependencies]
 yfinance = ["yfinance>=0.2"]
+qlib = ["pyqlib>=0.9.6"]
 dev = ["pytest>=7"]
 
 [project.scripts]
