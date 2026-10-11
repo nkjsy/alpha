@@ -38,3 +38,20 @@ def test_dump_and_read_back_with_qlib(tmp_path):
     assert np.nanmax(np.abs(out["r5"] - exp)) < 1e-5
     assert out["r5"].loc[d[45], "AAA"] != out["r5"].loc[d[45], "AAA"]   # 池外为 NaN
     assert set(out["roe"].columns) == {"AAA", "CON", "BBB"}
+
+
+def test_alpha158_runs_on_dumped_data(tmp_path):
+    pytest.importorskip("qlib")
+    from alpha.qlib_bridge import alpha158_frames, init_qlib
+
+    d = pd.bdate_range("2015-01-01", periods=150)
+    rng = np.random.default_rng(1)
+    close = pd.DataFrame(np.exp(np.cumsum(rng.normal(0, 0.01, (150, 3)), 0)) * 50, index=d, columns=["A", "B", "C"])
+    f = {"close": close, "open": close * 0.995, "high": close * 1.01, "low": close * 0.99, "vwap": close,
+         "volume": close * 0 + 1e6 * rng.uniform(0.5, 1.5, (150, 3)), "factor": close * 0 + 1}
+    dump_qlib(f, tmp_path, {"univ": close.notna()})
+    init_qlib(tmp_path)
+    me = d[d.is_month_end | (d == d[-1])]
+    out = alpha158_frames("univ", str(d[0].date()), str(d[-1].date()), me, batch=60)
+    assert len(out) == 158
+    assert out["a158_ROC5"].iloc[-1].notna().all()

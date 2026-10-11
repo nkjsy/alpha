@@ -6,3 +6,5 @@ __pycache__/
 data/cache/
 output/
 *.ipynb_checkpoints
+mlruns/
+tmp/

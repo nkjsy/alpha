@@ -112,13 +112,16 @@ python scripts/mine_factors.py --membership data/sp500_monthly_constituents.csv 
 python scripts/build_r1000_universe.py --extra-membership data/sp500_monthly_constituents.csv --sec-user-agent "名字 邮箱"
 # 2. 挖掘：加行业中性版本、内部人交易、13F 机构持仓，并在标普500子池内复核
 python scripts/mine_factors.py --membership data/r1000_monthly_constituents.csv --cache data/cache/r1000_yahoo_raw.pkl \
-    --industry --insider --inst --sub-membership data/sp500_monthly_constituents.csv --out output/factor_mining_r1000
+    --industry --insider --inst --alpha158 --ml --sub-membership data/sp500_monthly_constituents.csv --out output/factor_mining_r1000
 ```
 
 - **行业中性**（`--industry`）：SEC 登记的 SIC 代码映射到 Fama-French 12 行业，对价值/质量因子额外评估行业内去均值的版本（后缀 `|ind`）。SIC 是当前值，不是历史时点值。
 - **内部人**（`--insider`）：SEC Insider Transactions Data Sets，只用原始 Form 4 中的公开市场买入（P）/卖出（S），按提交日 + 1 个交易日生效，窗口半年。
 - **机构持仓**（`--inst`）：SEC Form 13F Data Sets（2013 年起），只统计在截止日（季末 + 45 天）前提交的原始 13F-HR，截止日后才生效；CUSIP 通过 SEC fails-to-deliver 数据对照成 ticker。
 - **子池复核**（`--sub-membership`）：输出 `ic_incr_sub`/`t_incr_sub`，看因子在你实际交易的股票（如标普500）里是否同样有效。
+- **qlib**（`--alpha158`、`--ml`，需 `pip install pyqlib`）：把价格和全部字段写成 qlib 的二进制格式（`alpha/qlib_bridge.py`，默认 `data/qlib_us`），
+  用 qlib 的表达式引擎算出 Alpha158 的 158 个价量因子作为候选；`--ml` 用 qlib 的 DatasetH + LGBModel 把全部候选合成一个打分
+  （研究期前 70% 训练、后 30% 验证，留出期只预测一次），模型本身也计 1 次试验。增量 IC、多重检验和 Deflated Sharpe 仍由本框架负责。
 - 近似罗素1000的候选池缺少“不在标普500且已退市”的公司，仍有幸存者偏差；每次重跑请换新的 `--out`，否则试验次数会累加。
 
 ## 新增一个因子

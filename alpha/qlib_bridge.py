@@ -117,10 +117,18 @@ def dump_market_data(data: MarketData, raw: dict[str, pd.DataFrame], out_dir: st
     return dump_qlib(fields, out_dir, markets)
 
 
+def _allow_mlflow_file_store() -> None:
+    # qlib 的实验记录默认写本地 ./mlruns，新版 mlflow 需要显式允许文件存储
+    import os
+
+    os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
+
+
 def init_qlib(provider_uri: str | Path) -> None:
     import qlib
     from qlib.constant import REG_US
 
+    _allow_mlflow_file_store()
     qlib.init(provider_uri=str(provider_uri), region=REG_US, kernels=1)
 
 
@@ -146,3 +154,86 @@ def alpha158_expressions() -> dict[str, str]:
 
     exprs, names = Alpha158DL.get_feature_config()
     return dict(zip(names, exprs))
+
+
+def alpha158_frames(market: str, start: str, end: str, dates: pd.DatetimeIndex, batch: int = 20,
+                    prefix: str = "a158_") -> dict[str, pd.DataFrame]:
+    """分批计算 Alpha158，只保留 dates（如月末调仓日），控制内存。
+
+    Alpha158 在 t 日只用到 t 日收盘及以前的数据，配合 T+1 执行没有前视。
+    """
+    exprs = alpha158_expressions()
+    names = list(exprs)
+    out: dict[str, pd.DataFrame] = {}
+    for i in range(0, len(names), batch):
+        part = {n: exprs[n] for n in names[i : i + batch]}
+        for n, w in expression_frames(part, market, start, end).items():
+            out[prefix + n] = w.reindex(dates).astype(float)
+    return out
+
+
+def _long(frames: dict[str, pd.DataFrame], group: str) -> pd.DataFrame:
+    cols = {}
+    for name, w in frames.items():
+        try:
+            s = w.stack(future_stack=True)
+        except TypeError:  # pandas < 2.1
+            s = w.stack(dropna=False)
+        cols[(group, name)] = s
+    df = pd.DataFrame(cols)
+    df.index = df.index.set_names(["datetime", "instrument"])
+    return df
+
+
+def train_lgb_score(
+    features: dict[str, pd.DataFrame],
+    label: pd.DataFrame,
+    train: pd.DatetimeIndex,
+    valid: pd.DatetimeIndex,
+    test: pd.DatetimeIndex,
+    **lgb_params,
+) -> pd.DataFrame:
+    """用 qlib 的 DatasetH + LGBModel 训练截面打分模型，返回验证期和测试期的打分宽表。
+
+    features  {名字: 日期 × 代码}（建议已做截面标准化，股票池外为 NaN）
+    label     与调仓匹配的未来收益（日期 × 代码），训练时逐日转成截面排序分位，减少极端值影响
+    train / valid / test  调仓日；调用方负责在各段之间留出 horizon 长度的隔离
+    """
+    import tempfile
+
+    import qlib
+    from qlib.config import C
+    from qlib.contrib.model.gbdt import LGBModel
+    from qlib.data.dataset import DatasetH
+    from qlib.data.dataset.handler import DataHandlerLP
+    from qlib.data.dataset.loader import StaticDataLoader
+
+    _allow_mlflow_file_store()
+    if not C.registered:  # 模型训练会写 qlib 的实验记录，需要先 init（不读行情数据，空目录即可）
+        tmp = tempfile.mkdtemp(prefix="qlib_", dir=tempfile.gettempdir())
+        qlib.init(provider_uri=tmp, exp_manager={"class": "MLflowExpManager", "module_path": "qlib.workflow.expm",
+                                                 "kwargs": {"uri": (Path(tmp) / "mlruns").as_uri(),
+                                                            "default_exp_name": "alpha"}})
+    dates = train.union(valid).union(test)
+    feats = {k: v.reindex(dates) for k, v in features.items()}
+    lab = label.reindex(dates).rank(axis=1, pct=True) - 0.5
+    # 只保留至少有一个特征的股票日
+    any_feat = sum(v.notna().astype(int) for v in feats.values()) > 0
+    lab = lab.where(any_feat)
+    df = pd.concat([_long(feats, "feature"), _long({"LABEL0": lab}, "label")], axis=1)
+    df = df[df["feature"].notna().any(axis=1)].sort_index()
+
+    handler = DataHandlerLP(data_loader=StaticDataLoader(config=df), learn_processors=[{"class": "DropnaLabel"}])
+    seg = {"train": (train[0], train[-1]), "valid": (valid[0], valid[-1]), "test": (test[0], test[-1])}
+    ds = DatasetH(handler, segments=seg)
+    params = {"learning_rate": 0.05, "num_leaves": 31, "max_depth": 6, "subsample": 0.8, "colsample_bytree": 0.8,
+              "lambda_l2": 10.0, "num_threads": 4, "early_stopping_rounds": 50, "num_boost_round": 500}
+    params.update(lgb_params)
+    model = LGBModel(loss="mse", **params)
+    from qlib.workflow import R
+
+    with R.start(experiment_name="alpha_lgb"):   # 训练曲线记到 qlib 的实验记录里，结束后释放
+        model.fit(ds)
+        pred = pd.concat([model.predict(ds, "valid"), model.predict(ds, "test")])
+    pred = pred[~pred.index.duplicated()]
+    return pred.unstack(level="instrument").reindex(columns=label.columns)

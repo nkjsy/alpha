@@ -133,13 +133,18 @@ def industry_variants(cands: dict[str, pd.DataFrame], groups: pd.DataFrame, univ
 
 def run(data: MarketData, start: str, holdout: str, horizon: int = 21, lag: int = 1, top_n: int = 10,
         min_t: float = 3.0, max_corr: float = 0.6, log_path: str | Path = "output/factor_mining/experiments.jsonl",
-        groups: pd.DataFrame | None = None, sub_universe: pd.DataFrame | None = None):
-    """groups        行业宽表，给出时加入价值/质量因子的行业中性版本
-    sub_universe  子股票池（如标普500），给出时在子池内重算增量 IC，检查结论能否用到你实际交易的股票上
+        groups: pd.DataFrame | None = None, sub_universe: pd.DataFrame | None = None,
+        extra_candidates: dict[str, pd.DataFrame] | None = None, ml: bool = False, ml_params: dict | None = None):
+    """groups            行业宽表，给出时加入价值/质量因子的行业中性版本
+    sub_universe      子股票池（如标普500），给出时在子池内重算增量 IC，检查结论能否用到你实际交易的股票上
+    extra_candidates  额外的候选因子（如 qlib Alpha158），与内置候选一起检验、一起计入试验次数
+    ml                用 qlib LightGBM 把全部候选合成一个打分：研究期前 70% 训练、后 30% 验证，留出期只预测一次
     """
     reb, research, hold = research_and_holdout_dates(data.dates, start, holdout, lag, horizon)
     fwd = data.forward_returns(horizon=horizon, lag=lag).reindex(reb)
     cands = build_candidates(CANDIDATES, data, dates=reb)
+    if extra_candidates:
+        cands.update({k: v.reindex(reb) for k, v in extra_candidates.items()})
     if groups is not None:
         cands.update(industry_variants(cands, groups.reindex(reb), data.universe.reindex(reb)))
     base_raw = build_candidates([BASELINE], data, dates=reb)
@@ -169,34 +174,35 @@ def run(data: MarketData, start: str, holdout: str, horizon: int = 21, lag: int 
     if res.selected:
         combo = equal_weight({"base": base_proc, **oriented(res.factors, res.table, res.selected)})
         bts["基准 + 入选因子"] = backtest_split(combo, data.close, reb, holdout, top_n, cost)
+    if ml:
+        from alpha.qlib_bridge import train_lgb_score
+
+        k = int(len(research) * 0.7)
+        train, valid = research[: k - 1], research[k:]   # 中间空一个调仓期，避免标签窗口重叠
+        feats = {**res.factors, "base_momentum": base_proc.reindex(reb)}
+        score = train_lgb_score(feats, fwd, train, valid, hold, **(ml_params or {}))
+        log.log("ml:qlib_lgb", {"features": len(feats), "holdout": holdout}, {})
+        for name, d in (("valid_ic", valid), ("holdout_ic", hold)):
+            ic = information_coefficient(score.reindex(d), fwd.reindex(d))
+            holdout_table.loc["qlib LightGBM", name] = ic.mean()
+            holdout_table.loc["qlib LightGBM", name.replace("ic", "t")] = ic.mean() / ic.std() * np.sqrt(len(ic))
+        # 验证期当作“研究期”回测（模型没见过这段的标签），留出期照常
+        sc = score.where(data.universe.reindex_like(score).fillna(False).astype(bool))
+        targets = build_weights(sc, sc.index, n_long=top_n)
+        val_t = targets[targets.index.isin(valid)]
+        close_v = data.close[data.close.index < pd.Timestamp(holdout)]
+        val_t = val_t[close_v.index.get_indexer(val_t.index) + 1 < len(close_v)]
+        bt_v = run_backtest(val_t, close_v, lag=1, costs=cost)
+        bt_h = run_backtest(targets[targets.index >= pd.Timestamp(holdout)], data.close, lag=1, costs=cost)
+        bts["qlib LightGBM（验证期）"] = {"research": bt_v.summary(), "holdout": bt_h.summary(), "_is_returns": bt_v.returns}
     n_trials = log.n_trials()
     for v in bts.values():
         v["research"]["dsr"] = deflated_sharpe_ratio(v.pop("_is_returns"), n_trials)
     return res, holdout_table, bts, n_trials
 
 
-def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument("--membership", required=True)
-    p.add_argument("--start", default="2011-01-01", help="研究期起点（之前一年用于因子预热）")
-    p.add_argument("--holdout", default="2022-01-01")
-    p.add_argument("--min-t", type=float, default=3.0)
-    p.add_argument("--max-corr", type=float, default=0.6)
-    p.add_argument("--top-n", type=int, default=10)
-    p.add_argument("--cache", default="data/cache/nasdaq100_yahoo_raw.pkl")
-    p.add_argument("--refresh", action="store_true")
-    p.add_argument("--no-sec", action="store_true", help="不下载 SEC 基本面，只挖价量因子")
-    p.add_argument("--sec-user-agent", default="alpha-research research@example.com",
-                   help="SEC 要求的 User-Agent，格式“名字 邮箱”")
-    p.add_argument("--sec-cache", default="data/cache/sec")
-    p.add_argument("--yahoo-start", default=None, help="价格下载起点，默认全部历史")
-    p.add_argument("--industry", action="store_true", help="加入价值/质量因子的行业中性版本（SEC SIC -> FF12）")
-    p.add_argument("--insider", action="store_true", help="加入内部人交易因子（SEC Form 4 数据集）")
-    p.add_argument("--inst", action="store_true", help="加入机构持仓变化因子（SEC 13F 数据集，2013 年起）")
-    p.add_argument("--sub-membership", default=None, help="子股票池成分表（如标普500），在子池内复核增量 IC")
-    p.add_argument("--out", default="output/factor_mining")
-    args = p.parse_args()
-
+def load_inputs(args) -> tuple[MarketData, dict, pd.DataFrame | None, pd.DataFrame | None]:
+    """按命令行参数下载/读取价格、SEC 财报和另类数据，返回 (data, raw, groups, sub_universe)。"""
     membership = load_membership(args.membership, "2010-01-01")
     tickers = sorted(membership["ticker"].unique())
     raw = download_yahoo_ohlcv(tickers, args.cache, args.refresh, start=args.yahoo_start)
@@ -232,11 +238,50 @@ def main() -> None:
     if args.sub_membership:
         sub_universe = snapshot_mask(load_membership(args.sub_membership, "2010-01-01"), adj.index, adj.columns)
     data = market_from_yahoo_raw(raw, universe=universe, fields=fields)
+    return data, raw, groups, sub_universe
+
+
+
+def main() -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("--membership", required=True)
+    p.add_argument("--start", default="2011-01-01", help="研究期起点（之前一年用于因子预热）")
+    p.add_argument("--holdout", default="2022-01-01")
+    p.add_argument("--min-t", type=float, default=3.0)
+    p.add_argument("--max-corr", type=float, default=0.6)
+    p.add_argument("--top-n", type=int, default=10)
+    p.add_argument("--cache", default="data/cache/nasdaq100_yahoo_raw.pkl")
+    p.add_argument("--refresh", action="store_true")
+    p.add_argument("--no-sec", action="store_true", help="不下载 SEC 基本面，只挖价量因子")
+    p.add_argument("--sec-user-agent", default="alpha-research research@example.com",
+                   help="SEC 要求的 User-Agent，格式“名字 邮箱”")
+    p.add_argument("--sec-cache", default="data/cache/sec")
+    p.add_argument("--yahoo-start", default=None, help="价格下载起点，默认全部历史")
+    p.add_argument("--industry", action="store_true", help="加入价值/质量因子的行业中性版本（SEC SIC -> FF12）")
+    p.add_argument("--insider", action="store_true", help="加入内部人交易因子（SEC Form 4 数据集）")
+    p.add_argument("--inst", action="store_true", help="加入机构持仓变化因子（SEC 13F 数据集，2013 年起）")
+    p.add_argument("--sub-membership", default=None, help="子股票池成分表（如标普500），在子池内复核增量 IC")
+    p.add_argument("--alpha158", action="store_true", help="把数据写成 qlib 格式，加入 qlib Alpha158 的 158 个价量因子")
+    p.add_argument("--ml", action="store_true", help="用 qlib LightGBM 合成全部候选，留出期检验一次（需 pip install pyqlib）")
+    p.add_argument("--qlib-dir", default="data/qlib_us")
+    p.add_argument("--out", default="output/factor_mining")
+    args = p.parse_args()
+
+    data, raw, groups, sub_universe = load_inputs(args)
+    extra = {}
+    if args.alpha158:
+        from alpha.qlib_bridge import alpha158_frames, dump_market_data, init_qlib
+
+        qdir = dump_market_data(data, raw, args.qlib_dir, market="universe")
+        init_qlib(qdir)
+        reb, _, _ = research_and_holdout_dates(data.dates, args.start, args.holdout, 1, 21)
+        extra = alpha158_frames("universe", str(data.dates[0].date()), str(data.dates[-1].date()), reb)
+        print(f"qlib Alpha158：{len(extra)} 个因子，数据目录 {qdir}")
 
     out = Path(args.out)
     res, hold, bts, n_trials = run(data, args.start, args.holdout, top_n=args.top_n, min_t=args.min_t,
                                    max_corr=args.max_corr, log_path=out / "experiments.jsonl",
-                                   groups=groups, sub_universe=sub_universe)
+                                   groups=groups, sub_universe=sub_universe, extra_candidates=extra, ml=args.ml)
     pd.set_option("display.width", 220)
     cols = ["ic_mean", "t_stat", "ic_incr", "t_incr", "q_bh", "sign_stable", "corr_baseline", "rank_autocorr", "ls_ann", "selected"]
     if "t_incr_sub" in res.table:
@@ -245,7 +290,7 @@ def main() -> None:
     print(res.table[cols].astype({"q_bh": float}).round(3).to_string())
     print(f"\n入选（|t_incr|≥{args.min_t}、q≤0.05、前后半段同号、互相关≤{args.max_corr}）：{res.selected or '无'}")
     if len(hold):
-        print("\n== 留出期 IC（只看一次） ==")
+        print("\n== 留出期 IC（只看一次；qlib LightGBM 另列验证期 IC） ==")
         print(hold.round(3).to_string())
     print(f"\n== Top{args.top_n} 纯多头组合，T+1、单边 5bp；累计试验 {n_trials} 次 ==")
     for name, v in bts.items():
