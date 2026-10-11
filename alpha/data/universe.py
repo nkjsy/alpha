@@ -58,3 +58,61 @@ def snapshot_mask(
         if end > pos:
             mask.iloc[pos:end, mask.columns.get_indexer(members)] = True
     return mask
+
+
+def liquid_pool(dollar_volume: pd.DataFrame, n: int, window: int = 63, start: str | None = None) -> list[str]:
+    """月末按过去 window 日平均成交额排名，返回“曾进入前 n 名”的股票，用来缩小待下载基本面的范围。"""
+    adv = dollar_volume.rolling(window, min_periods=window // 2).mean()
+    me = adv.groupby(adv.index.to_period("M")).tail(1)
+    if start is not None:
+        me = me[me.index >= pd.Timestamp(start)]
+    ranks = me.rank(axis=1, ascending=False)
+    return sorted(ranks.columns[(ranks <= n).any()])
+
+
+def cap_rank_membership(
+    market_cap: pd.DataFrame,
+    n: int = 1000,
+    rank_month: int = 5,
+    start: str | None = None,
+    fallback: pd.DataFrame | None = None,
+    always: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """仿罗素1000：每年 rank_month 月最后一个交易日按市值取前 n 名，从下个月末的快照起生效，持有一年。
+
+    只用排名日当天已知的市值（市值字段本身已按财报披露日对齐），返回每月末快照
+    (month_end_date, ticker)，交给 snapshot_mask 使用。
+
+    fallback  排名日有市值的股票不足 n 只时（如 2009–2010 年 XBRL 尚未普及），用这个分数（如平均成交额）
+              在没有市值的股票里补足；
+    always    (month_end_date, ticker) 快照，当月一定纳入（如标普500成分，罗素1000理应全部包含）。
+    """
+    dates = market_cap.index
+    month_last = dates.to_series().groupby(dates.to_period("M")).max()
+    month_last = pd.DatetimeIndex(month_last.to_numpy())
+    rank_dates = [d for d in month_last if d.month == rank_month]
+    tops: dict[pd.Timestamp, list[str]] = {}
+    for r in rank_dates:
+        cap = market_cap.loc[r].dropna()
+        top = list(cap.nlargest(n).index)
+        if len(top) < n and fallback is not None and r in fallback.index:
+            rest = fallback.loc[r].drop(index=top, errors="ignore").dropna()
+            top += list(rest.nlargest(n - len(top)).index)
+        tops[r] = top
+    forced: dict[pd.Period, set] = {}
+    if always is not None:
+        a = always.assign(month_end_date=pd.to_datetime(always["month_end_date"]))
+        for d, g in a.groupby(a["month_end_date"].dt.to_period("M")):
+            forced[d] = set(g["ticker"])
+    rows = []
+    for d in month_last:
+        prior = [r for r in rank_dates if r.to_period("M") < d.to_period("M")]
+        if not prior:
+            continue
+        if start is not None and d < pd.Timestamp(start):
+            continue
+        members = list(tops[prior[-1]])
+        extra = forced.get(d.to_period("M"), set()) - set(members)
+        members += sorted(t for t in extra if t in market_cap.columns)
+        rows.extend((d, t) for t in members)
+    return pd.DataFrame(rows, columns=["month_end_date", "ticker"])

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import re
 import time
 from pathlib import Path
 from typing import Iterable
@@ -27,7 +28,9 @@ import pandas as pd
 from alpha.factors.fundamental import align_fundamental
 
 TICKER_MAP_URL = "https://www.sec.gov/files/company_tickers.json"
+TICKER_EXCHANGE_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
 FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
+SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik:010d}.json"
 
 # 字段 -> (类型, 按优先级排列的 (taxonomy, tag, unit))
 CONCEPTS: dict[str, tuple[str, list[tuple[str, str, str]]]] = {
@@ -62,11 +65,19 @@ CONCEPTS: dict[str, tuple[str, list[tuple[str, str, str]]]] = {
         ("us-gaap", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest", "USD"),
     ]),
     "liabilities": ("instant", [("us-gaap", "Liabilities", "USD")]),
+    # 多类股公司（V、META、GOOGL 等）的分类别股本是带维度的数据，companyfacts 接口不提供，
+    # 前两个 tag 往往缺失，此时退而用加权平均股本（全部类别合计）
     "shares": ("instant", [
         ("dei", "EntityCommonStockSharesOutstanding", "shares"),
         ("us-gaap", "CommonStockSharesOutstanding", "shares"),
+        ("us-gaap", "WeightedAverageNumberOfDilutedSharesOutstanding", "shares"),
+        ("us-gaap", "WeightedAverageNumberOfSharesOutstandingBasic", "shares"),
     ]),
 }
+
+# 这些字段的低优先级 tag 只用来填补高优先级 tag 覆盖不到的时段，不与之穿插（口径不同，穿插会来回跳）
+GAP_FILL_FIELDS = {"shares"}
+GAP_DAYS = 200
 
 QUARTER_DAYS = (75, 105)
 ANNUAL_DAYS = (340, 390)
@@ -74,18 +85,18 @@ ANNUAL_DAYS = (340, 390)
 
 # ----------------------------------------------------------------------------- 下载
 
-def _get_json(url: str, user_agent: str, retries: int = 3) -> dict:
+def get_bytes(url: str, user_agent: str, retries: int = 3, timeout: int = 120) -> bytes:  # pragma: no cover - network
     import urllib.request
 
     req = urllib.request.Request(url, headers={"User-Agent": user_agent, "Accept-Encoding": "gzip"})
     for i in range(retries):
         try:
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 raw = r.read()
                 if r.headers.get("Content-Encoding") == "gzip":
                     raw = gzip.decompress(raw)
-                return json.loads(raw)
-        except Exception as e:  # pragma: no cover - network
+                return raw
+        except Exception as e:
             if getattr(e, "code", None) == 404:
                 raise
             if i == retries - 1:
@@ -94,16 +105,98 @@ def _get_json(url: str, user_agent: str, retries: int = 3) -> dict:
     raise RuntimeError("unreachable")
 
 
+def _get_json(url: str, user_agent: str, retries: int = 3) -> dict:  # pragma: no cover - network
+    return json.loads(get_bytes(url, user_agent, retries))
+
+
+def _cached_json(url: str, user_agent: str, f: Path) -> dict:
+    if f.exists():
+        return json.loads(f.read_text())
+    data = _get_json(url, user_agent)  # pragma: no cover - network
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps(data))
+    return data
+
+
 def fetch_ticker_map(user_agent: str, cache_dir: str | Path) -> dict[str, int]:
     """当前上市公司的 ticker -> CIK。已退市公司不在其中，可用 extra_map 补充。"""
-    f = Path(cache_dir) / "company_tickers.json"
-    if f.exists():
-        data = json.loads(f.read_text())
-    else:  # pragma: no cover - network
-        data = _get_json(TICKER_MAP_URL, user_agent)
-        f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_text(json.dumps(data))
+    data = _cached_json(TICKER_MAP_URL, user_agent, Path(cache_dir) / "company_tickers.json")
     return {v["ticker"].upper().replace(".", "-"): int(v["cik_str"]) for v in data.values()}
+
+
+def fetch_listed_companies(user_agent: str, cache_dir: str | Path,
+                           exchanges: tuple[str, ...] = ("NYSE", "Nasdaq")) -> pd.DataFrame:
+    """当前在交易所挂牌的公司（ticker, cik, name, exchange）。只有现存公司，已退市的不在其中。"""
+    data = _cached_json(TICKER_EXCHANGE_URL, user_agent, Path(cache_dir) / "company_tickers_exchange.json")
+    df = pd.DataFrame(data["data"], columns=data["fields"])
+    df["ticker"] = df["ticker"].astype(str).str.upper().str.replace(".", "-", regex=False)
+    return df[df["exchange"].isin(exchanges)].reset_index(drop=True)
+
+
+def fetch_sic(tickers: Iterable[str], user_agent: str, cache_dir: str | Path, sleep: float = 0.12) -> pd.Series:
+    """ticker -> SIC 行业代码（来自 submissions API，结果缓存在 sic.csv）。
+
+    注意：SIC 是公司当前的登记行业，不是历史时点值；公司改行业很少见，前视影响很小。
+    """
+    cache = Path(cache_dir)
+    f = cache / "sic.csv"
+    known = pd.read_csv(f, dtype={"ticker": str}).set_index("ticker")["sic"] if f.exists() else pd.Series(dtype=float)
+    todo = [t for t in tickers if t not in known.index]
+    if todo:  # pragma: no cover - network
+        cmap = fetch_ticker_map(user_agent, cache)
+        new = {}
+        for i, t in enumerate(todo):
+            cik = cmap.get(t)
+            if cik is None:
+                new[t] = np.nan
+                continue
+            try:
+                sic = _get_json(SUBMISSIONS_URL.format(cik=cik), user_agent).get("sic")
+                new[t] = float(sic) if sic not in (None, "") else np.nan
+            except Exception as e:
+                print(f"SIC 下载失败 {t}：{e}")
+                continue
+            time.sleep(sleep)
+            if (i + 1) % 100 == 0:
+                print(f"SIC {i + 1}/{len(todo)}")
+        known = pd.concat([known, pd.Series(new, name="sic")])
+        cache.mkdir(parents=True, exist_ok=True)
+        known.rename_axis("ticker").rename("sic").to_csv(f)
+    return known.reindex(list(tickers))
+
+
+# Fama-French 12 行业（按 SIC 区间），未覆盖的归入 Other
+FF12 = {
+    "NoDur": [(100, 999), (2000, 2399), (2700, 2749), (2770, 2799), (3100, 3199), (3940, 3989)],
+    "Durbl": [(2500, 2519), (2590, 2599), (3630, 3659), (3710, 3711), (3714, 3714), (3716, 3716), (3750, 3751),
+              (3792, 3792), (3900, 3939), (3990, 3999)],
+    "Manuf": [(2520, 2589), (2600, 2699), (2750, 2769), (3000, 3099), (3200, 3569), (3580, 3629), (3700, 3709),
+              (3712, 3713), (3715, 3715), (3717, 3749), (3752, 3791), (3793, 3799), (3830, 3839), (3860, 3899)],
+    "Enrgy": [(1200, 1399), (2900, 2999)],
+    "Chems": [(2800, 2829), (2840, 2899)],
+    "BusEq": [(3570, 3579), (3660, 3692), (3694, 3699), (3810, 3829), (7370, 7379)],
+    "Telcm": [(4800, 4899)],
+    "Utils": [(4900, 4949)],
+    "Shops": [(5000, 5999), (7200, 7299), (7600, 7699)],
+    "Hlth": [(2830, 2839), (3693, 3693), (3840, 3859), (8000, 8099)],
+    "Money": [(6000, 6999)],
+}
+
+
+def sic_to_ff12(sic: float) -> str | None:
+    if sic is None or not np.isfinite(sic):
+        return None
+    s = int(sic)
+    for name, ranges in FF12.items():
+        if any(lo <= s <= hi for lo, hi in ranges):
+            return name
+    return "Other"
+
+
+def industry_frame(sic: pd.Series, dates: pd.DatetimeIndex) -> pd.DataFrame:
+    """把 ticker -> SIC 变成行业宽表（每天相同），供 neutralize / 行业中性因子使用。"""
+    ind = sic.map(sic_to_ff12)
+    return pd.DataFrame([ind.to_numpy()] * len(dates), index=dates, columns=sic.index)
 
 
 def extract_records(facts: dict) -> pd.DataFrame:
@@ -125,9 +218,13 @@ def extract_records(facts: dict) -> pd.DataFrame:
 
 def fetch_records(
     tickers: Iterable[str], user_agent: str, cache_dir: str | Path, extra_map: dict[str, int] | None = None,
-    refresh: bool = False, sleep: float = 0.12,
+    refresh: bool = False, sleep: float = 0.12, extra_ciks: dict[str, list[int]] | None = None,
 ) -> dict[str, pd.DataFrame]:
-    """逐个 ticker 下载并抽取记录，结果按 ticker 缓存为小 pickle。"""
+    """逐个 ticker 下载并抽取记录，结果按 ticker 缓存为小 pickle。
+
+    extra_ciks 为 {ticker: [旧 CIK]}：公司重组成新的控股公司后，SEC 的 ticker 映射只指向新 CIK
+    （如 XOM），旧 CIK 下的历史财报要另外下载再合并。见 historical_ciks。
+    """
     cache = Path(cache_dir)
     cache.mkdir(parents=True, exist_ok=True)
     cmap = fetch_ticker_map(user_agent, cache)
@@ -154,9 +251,84 @@ def fetch_records(
         time.sleep(sleep)
         if (i + 1) % 25 == 0:
             print(f"SEC {i + 1}")
+    for t, ciks in (extra_ciks or {}).items():
+        if t not in out and t not in cmap:
+            continue
+        extra = []
+        for cik in ciks:
+            f = cache / f"{t}__{cik}.pkl"
+            if not f.exists() or refresh:
+                try:  # pragma: no cover - network
+                    extract_records(_get_json(FACTS_URL.format(cik=cik), user_agent)).to_pickle(f)
+                    time.sleep(sleep)
+                except Exception as e:  # pragma: no cover - network
+                    print(f"SEC 下载失败 {t}（旧 CIK {cik}）：{e}")
+                    continue
+            extra.append(pd.read_pickle(f))
+        if extra:
+            frames = [x for x in [*extra, out.get(t)] if x is not None and len(x)]
+            if frames:
+                out[t] = pd.concat(frames, ignore_index=True)
     if missing:
         print(f"SEC 找不到 CIK 的 ticker {len(missing)} 只（多为已退市）：{', '.join(missing)}")
     return out
+
+
+def historical_ciks(events: pd.DataFrame, cmap: dict[str, int]) -> dict[str, list[int]]:
+    """从 Form 4 记录（发行人代码 + CIK）找出“同一 ticker 以前用过的其它 CIK”。
+
+    排除仍是其它现存 ticker 当前 CIK 的（那是另一家还在交易的公司，ticker 被重新分配过）。
+    """
+    if events is None or events.empty:
+        return {}
+    pairs = events.dropna(subset=["cik"]).assign(cik=lambda d: d["cik"].astype(int))
+    pairs = pairs[pairs["symbol"] != ""].groupby(["symbol", "cik"])["filed"].max().reset_index()
+    current = set(cmap.values())
+    out: dict[str, list[int]] = {}
+    for sym, g in pairs.groupby("symbol"):
+        cur = cmap.get(sym)
+        if cur is None:
+            continue
+        old = [int(c) for c in g.sort_values("filed")["cik"] if c != cur and c not in current]
+        if old:
+            out[sym] = old
+    return out
+
+
+_NAME_SUFFIXES = {"inc", "incorporated", "corp", "corporation", "co", "company", "plc", "ltd", "limited", "holdings",
+                  "holding", "group", "the", "nv", "sa", "llc", "lp", "ag", "se", "de", "new"}
+
+
+def _norm_name(name: str) -> str:
+    words = re.findall(r"[a-z0-9]+", str(name).lower())
+    return "".join(w for w in words if w not in _NAME_SUFFIXES)
+
+
+def same_company(names_a: Iterable[str], names_b: Iterable[str], prefix: int = 5) -> bool:
+    """两组公司名（现名 + 曾用名）里有一对相似：前 prefix 个字符相同，或一个包含另一个。"""
+    a = {n for n in map(_norm_name, names_a) if n}
+    b = {n for n in map(_norm_name, names_b) if n}
+    for x in a:
+        for y in b:
+            if x[:prefix] == y[:prefix] or x in y or y in x:
+                return True
+    return False
+
+
+def company_names(cik: int, user_agent: str, cache_dir: str | Path) -> list[str]:
+    """SEC submissions 里的公司现名和曾用名，按 CIK 缓存。"""
+    f = Path(cache_dir) / "names" / f"{int(cik)}.json"
+    if f.exists():
+        return json.loads(f.read_text())
+    try:  # pragma: no cover - network
+        data = _get_json(SUBMISSIONS_URL.format(cik=int(cik)), user_agent)
+    except Exception as e:  # pragma: no cover - network
+        print(f"CIK {cik} 公司名获取失败：{e}")
+        return []
+    names = [data.get("name") or ""] + [x.get("name") or "" for x in data.get("formerNames") or []]  # pragma: no cover
+    f.parent.mkdir(parents=True, exist_ok=True)  # pragma: no cover
+    f.write_text(json.dumps(names))  # pragma: no cover
+    return names  # pragma: no cover
 
 
 # ----------------------------------------------------------------------------- 整理
@@ -236,8 +408,11 @@ def sue(rec: pd.DataFrame, window: int = 8, min_obs: int = 4) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["end", "val", "filed"])
 
 
-def _combine_tags(rec: pd.DataFrame, builder) -> pd.DataFrame:
-    """按优先级对各个 tag 分别构建序列，再按 end 合并（同一 end 取高优先级 tag）。"""
+def _combine_tags(rec: pd.DataFrame, builder, gap_fill: bool = False) -> pd.DataFrame:
+    """按优先级对各个 tag 分别构建序列，再按 end 合并（同一 end 取高优先级 tag）。
+
+    gap_fill=True 时，低优先级 tag 的记录只在距离所有更高优先级记录都超过 GAP_DAYS 天时才使用。
+    """
     parts = []
     for prio, g in rec.groupby("prio"):
         s = builder(g)
@@ -245,6 +420,17 @@ def _combine_tags(rec: pd.DataFrame, builder) -> pd.DataFrame:
             parts.append(s.assign(prio=prio))
     if not parts:
         return pd.DataFrame(columns=["end", "val", "filed"])
+    if gap_fill:
+        kept = [parts[0]]
+        for p in parts[1:]:
+            ends = pd.concat(kept)["end"].sort_values().to_numpy()
+            pos = np.searchsorted(ends, p["end"].to_numpy())
+            prev = np.where(pos > 0, ends[np.maximum(pos - 1, 0)], np.datetime64("NaT", "ns"))
+            nxt = np.where(pos < len(ends), ends[np.minimum(pos, len(ends) - 1)], np.datetime64("NaT", "ns"))
+            gap = np.timedelta64(GAP_DAYS, "D")
+            far = ~((p["end"].to_numpy() - prev) <= gap) & ~((nxt - p["end"].to_numpy()) <= gap)
+            kept.append(p[far])
+        parts = kept
     allp = pd.concat(parts).sort_values(["end", "prio"])
     return allp.drop_duplicates("end", keep="first")[["end", "val", "filed"]].reset_index(drop=True)
 
@@ -256,7 +442,7 @@ def point_in_time_series(records: dict[str, pd.DataFrame]) -> dict[str, pd.DataF
     for t, rec in records.items():
         for field, g in rec.groupby("field"):
             kind = CONCEPTS[field][0]
-            s = _combine_tags(g, builders[kind])
+            s = _combine_tags(g, builders[kind], gap_fill=field in GAP_FILL_FIELDS)
             name = f"{field}_ttm" if kind == "flow" else field
             if len(s):
                 out.setdefault(name, []).append(s.assign(ticker=t))
@@ -315,6 +501,11 @@ def build_fields(
             df, dates, tickers, "val", lag_days=lag_days,
             max_staleness=sue_staleness if name == "sue" else max_staleness,
         )
+    if {"net_income_ttm", "eps_ttm"} <= fields.keys():
+        # 仍缺股本时用 净利润 / 每股收益 反推（如 Visa 连加权平均股本都只有分类别数据）
+        eps = fields["eps_ttm"].where(fields["eps_ttm"].abs() > 0.05)
+        implied = (fields["net_income_ttm"] / eps).where(lambda x: x > 0)
+        fields["shares"] = fields["shares"].combine_first(implied) if "shares" in fields else implied
     if "shares" in fields:
         fields["market_cap"] = close_split_adj.reindex(index=dates, columns=tickers) * fields["shares"]
     if "equity" in fields:
