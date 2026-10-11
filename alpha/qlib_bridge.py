@@ -156,7 +156,7 @@ def alpha158_expressions() -> dict[str, str]:
     return dict(zip(names, exprs))
 
 
-def alpha158_frames(market: str, start: str, end: str, dates: pd.DatetimeIndex, batch: int = 20,
+def alpha158_frames(market: str, start: str, end: str, dates: pd.DatetimeIndex, batch: int = 10,
                     prefix: str = "a158_") -> dict[str, pd.DataFrame]:
     """分批计算 Alpha158，只保留 dates（如月末调仓日），控制内存。
 
