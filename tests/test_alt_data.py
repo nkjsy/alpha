@@ -203,3 +203,33 @@ def test_cap_rank_fallback_and_forced_members():
     assert jun10 == {"c", "d"}          # 2010-05 没有市值，按成交额补足
     assert jul10 == {"c", "d"}
     assert jun11 == {"a", "b"}
+
+
+def test_same_company_names():
+    from alpha.data.sec import same_company
+
+    assert same_company(["EXXON MOBIL CORP"], ["Exxon Mobil Corporation"])
+    assert same_company(["MEDTRONIC INC"], ["Medtronic plc", "Medtronic Holdings Ltd"])
+    assert not same_company(["BARNES GROUP INC"], ["Barrick Mining Corp", "BARRICK GOLD CORP"])
+    assert not same_company(["GREAT ATLANTIC & PACIFIC TEA CO INC"], ["GAP INC"])
+    assert not same_company([""], ["GAP INC"])
+
+
+def test_merge_old_ciks_guards():
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location("b", Path(__file__).parents[1] / "scripts" / "build_r1000_universe.py")
+    b = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(b)
+    names = {"XOM": ["Exxon Mobil Corp"], 34088: ["EXXON MOBIL CORP"], "B": ["Barrick Mining Corp"],
+             9984: ["BARNES GROUP INC"], "NEW": ["New Co"], 1: ["New Co"], "GOOG": ["Alphabet Inc."],
+             1288776: ["Google Inc."]}
+    ts = pd.Timestamp
+    cand = {"XOM": [34088], "B": [9984], "NEW": [1], "GOOG": [1288776]}
+    first_px = pd.Series({"XOM": ts("2008-01-02"), "B": ts("2008-01-02"), "NEW": ts("2020-01-02"),
+                          "GOOG": ts("2008-01-02")})
+    first_filed = {"XOM": ts("2025-06-01"), "B": ts("2015-01-01"), "NEW": ts("2020-06-01"),
+                   "GOOG": ts("2015-10-01")}
+    out = b.merge_old_ciks(cand, first_px, first_filed, lambda x: names.get(x, []), {"GOOG": [1288776]})
+    assert out == {"XOM": [34088], "GOOG": [1288776]}

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import re
 import time
 from pathlib import Path
 from typing import Iterable
@@ -292,6 +293,42 @@ def historical_ciks(events: pd.DataFrame, cmap: dict[str, int]) -> dict[str, lis
         if old:
             out[sym] = old
     return out
+
+
+_NAME_SUFFIXES = {"inc", "incorporated", "corp", "corporation", "co", "company", "plc", "ltd", "limited", "holdings",
+                  "holding", "group", "the", "nv", "sa", "llc", "lp", "ag", "se", "de", "new"}
+
+
+def _norm_name(name: str) -> str:
+    words = re.findall(r"[a-z0-9]+", str(name).lower())
+    return "".join(w for w in words if w not in _NAME_SUFFIXES)
+
+
+def same_company(names_a: Iterable[str], names_b: Iterable[str], prefix: int = 5) -> bool:
+    """两组公司名（现名 + 曾用名）里有一对相似：前 prefix 个字符相同，或一个包含另一个。"""
+    a = {n for n in map(_norm_name, names_a) if n}
+    b = {n for n in map(_norm_name, names_b) if n}
+    for x in a:
+        for y in b:
+            if x[:prefix] == y[:prefix] or x in y or y in x:
+                return True
+    return False
+
+
+def company_names(cik: int, user_agent: str, cache_dir: str | Path) -> list[str]:
+    """SEC submissions 里的公司现名和曾用名，按 CIK 缓存。"""
+    f = Path(cache_dir) / "names" / f"{int(cik)}.json"
+    if f.exists():
+        return json.loads(f.read_text())
+    try:  # pragma: no cover - network
+        data = _get_json(SUBMISSIONS_URL.format(cik=int(cik)), user_agent)
+    except Exception as e:  # pragma: no cover - network
+        print(f"CIK {cik} 公司名获取失败：{e}")
+        return []
+    names = [data.get("name") or ""] + [x.get("name") or "" for x in data.get("formerNames") or []]  # pragma: no cover
+    f.parent.mkdir(parents=True, exist_ok=True)  # pragma: no cover
+    f.write_text(json.dumps(names))  # pragma: no cover
+    return names  # pragma: no cover
 
 
 # ----------------------------------------------------------------------------- 整理

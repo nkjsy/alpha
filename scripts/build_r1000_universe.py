@@ -30,8 +30,35 @@ import pandas as pd
 
 from alpha.data.insider import fetch_insider_events
 from alpha.data.loaders import download_yahoo_ohlcv, fill_missing_yahoo
-from alpha.data.sec import build_fields, fetch_listed_companies, fetch_records, fetch_ticker_map, historical_ciks
+from alpha.data.sec import (build_fields, company_names, fetch_listed_companies, fetch_records, fetch_ticker_map,
+                            historical_ciks, same_company)
 from alpha.data.universe import cap_rank_membership, liquid_pool
+
+
+# 重组时改了名、名字对不上的同一公司，手动确认后放这里
+SAME_COMPANY_CIKS = {"GOOG": [1288776], "GOOGL": [1288776]}
+
+
+def merge_old_ciks(cand: dict[str, list[int]], first_px: pd.Series, first_filed: dict[str, pd.Timestamp],
+                   names, allow: dict[str, list[int]] | None = None) -> dict[str, list[int]]:
+    """决定哪些旧 CIK 的财报并入当前 ticker。
+
+    条件一：股价历史比当前 CIK 的首份财报早一年以上（否则是新公司上市后才有财报，旧 CIK 属于别人）；
+    条件二：旧 CIK 的公司名（含曾用名）和当前 CIK 的相似，排除“ticker 被另一家公司重新使用”的情况
+    （如 B 曾是 Barnes Group、现在是 Barrick；GAP 曾是 A&P 超市、现在是 Gap）。
+    names(ticker 或 CIK) 返回公司名列表；allow 里的组合不看名字直接合并。
+    """
+    allow = allow or {}
+    out: dict[str, list[int]] = {}
+    for t, ciks in cand.items():
+        f0, p0 = first_filed.get(t), first_px.get(t)
+        if f0 is None or pd.isna(f0) or p0 is None or pd.isna(p0) or not p0 < f0 - pd.Timedelta(days=365):
+            continue
+        cur = names(t)
+        keep = [c for c in ciks if c in allow.get(t, []) or same_company(names(c), cur)]
+        if keep:
+            out[t] = keep
+    return out
 
 
 def build(raw: dict[str, pd.DataFrame], records: dict[str, pd.DataFrame], n: int, start: str,
@@ -102,16 +129,20 @@ def main() -> None:
     events = fetch_insider_events(2009, raw["close"].index[-1], args.sec_user_agent, args.sec_cache)
     cand = {t: c for t, c in historical_ciks(events, cmap).items() if t in set(liquid)}
     base = fetch_records(liquid, args.sec_user_agent, args.sec_cache)
-    # 只有“股价历史比当前 CIK 的首份财报早一年以上”的才合并旧 CIK：这是公司重组换了申报主体（如 XOM）。
-    # 反之是 ticker 被另一家新公司重新使用，旧 CIK 属于别的公司，不能并进来。
     first_px = sub["close"].apply(lambda s: s.first_valid_index())
-    old = {}
-    for t, c in cand.items():
-        rec = base.get(t)
-        if rec is None or rec.empty or pd.isna(first_px.get(t)):
-            continue
-        if first_px[t] < rec["filed"].min() - pd.Timedelta(days=365):
-            old[t] = c
+    first_filed = {t: r["filed"].min() for t, r in base.items() if r is not None and not r.empty}
+    titles = dict(zip(listed["ticker"], listed["name"]))
+
+    def names(x):
+        if isinstance(x, str):
+            return [titles.get(x, "")] + company_names(cmap[x], args.sec_user_agent, args.sec_cache)
+        return company_names(x, args.sec_user_agent, args.sec_cache)
+
+    old = merge_old_ciks(cand, first_px, first_filed, names, SAME_COMPANY_CIKS)
+    for t in sorted(set(cand) - set(old)):
+        if first_filed.get(t) is not None and first_px.get(t) is not None and \
+                first_px[t] < first_filed[t] - pd.Timedelta(days=365):
+            print(f"  {t} 名字对不上、不合并：现 {names(t)[:2]}，旧 {[names(c)[:1] for c in cand[t]]}")
     print(f"Form 4 里换过 CIK 的 {len(cand)} 只，其中判定为同一公司重组、合并旧 CIK 财报的 {len(old)} 只："
           f"{', '.join(sorted(old))}")
     records = fetch_records(liquid, args.sec_user_agent, args.sec_cache, extra_ciks=old)
